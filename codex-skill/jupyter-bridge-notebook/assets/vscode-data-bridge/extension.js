@@ -32,8 +32,10 @@ const QUICK_COMMANDS = [
 
 const DEFAULT_ENDPOINTS = [
   "GET /status",
+  "GET /servers",
   "GET /commands",
   "GET /capabilities",
+  "GET /compliance",
   "GET /notebook",
   "GET /notebook/dirty",
   "GET /cells",
@@ -57,6 +59,8 @@ const DEFAULT_ENDPOINTS = [
   "POST /cell/reveal",
   "POST /cell/replaceOutputs",
   "POST /cell/clearOutputs",
+  "POST /workflow/updateAndRun",
+  "POST /workflow/insertAndRun",
   "POST /run/current",
   "POST /run/cell",
   "POST /run/above",
@@ -93,38 +97,78 @@ const bridgeState = {
   lastNotebookAction: null,
   lastMutation: null,
   lastError: null,
+  server: {
+    host: null,
+    port: null,
+    basePort: null,
+    portSpan: null,
+    startedAt: null
+  },
   notebookRuntime: {},
   activeNotebook: {
     uri: null,
     switchedAt: null,
     switchCount: 0,
-    visibleEditors: 0
+    visibleEditors: 0,
+    selectionSnapshot: [],
+    versionToken: null
+  },
+  sidebar: {
+    lastUpdatedAt: null,
+    servers: [],
+    refreshing: false
   }
 };
 
 let bridgeServer;
 let output;
+let controlCenterProvider;
 
 function activate(context) {
   output = vscode.window.createOutputChannel("Data Bridge");
   context.subscriptions.push(output);
 
+  controlCenterProvider = new DataBridgeControlCenterProvider(context.extensionUri);
+
   context.subscriptions.push(
     vscode.window.onDidChangeActiveNotebookEditor((editor) => {
       updateActiveNotebookIdentity(editor, "active-editor-changed");
+      refreshControlCenterSoon();
     }),
     vscode.window.onDidChangeVisibleNotebookEditors((editors) => {
       bridgeState.activeNotebook.visibleEditors = editors.length;
+      refreshControlCenterSoon();
+    }),
+    vscode.window.onDidChangeNotebookEditorSelection((event) => {
+      updateSelectionObservation(event.notebookEditor, "selection-changed");
+      refreshControlCenterSoon();
     }),
     vscode.workspace.onDidChangeNotebookDocument((event) => {
       updateNotebookRuntimeFromEvent(event);
-    })
+      refreshControlCenterSoon();
+    }),
+    vscode.workspace.onDidChangeConfiguration(async (event) => {
+      if (event.affectsConfiguration("dataBridge")) {
+        try {
+          await handleConfigurationChange(event);
+        } catch (error) {
+          log(`Configuration update failed: ${error.stack || error.message}`);
+        } finally {
+          refreshControlCenterSoon();
+        }
+      }
+    }),
+    vscode.window.registerWebviewViewProvider("dataBridge.controlCenter", controlCenterProvider)
   );
 
   updateActiveNotebookIdentity(vscode.window.activeNotebookEditor || null, "activate");
   bridgeState.activeNotebook.visibleEditors = vscode.window.visibleNotebookEditors.length;
 
   context.subscriptions.push(
+    vscode.commands.registerCommand("dataBridge.openControlCenter", async () => openControlCenter()),
+    vscode.commands.registerCommand("dataBridge.refreshControlCenter", async () => {
+      await refreshControlCenter();
+    }),
     vscode.commands.registerCommand("dataBridge.startServer", async () => startServer()),
     vscode.commands.registerCommand("dataBridge.stopServer", async () => stopServer()),
     vscode.commands.registerCommand("dataBridge.showStatus", async () => showStatus()),
@@ -137,6 +181,8 @@ function activate(context) {
   if (getConfig().get("autoStart", true)) {
     startServer().catch((error) => log(`Auto-start failed: ${error.stack || error.message}`));
   }
+
+  refreshControlCenterSoon();
 }
 
 function deactivate() {
@@ -151,10 +197,12 @@ function getServerConfig() {
   const config = getConfig();
   const envHost = process.env.DATA_BRIDGE_HOST || process.env.VSCODE_DATA_BRIDGE_HOST;
   const envPort = process.env.DATA_BRIDGE_PORT || process.env.VSCODE_DATA_BRIDGE_PORT;
+  const envPortSpan = process.env.DATA_BRIDGE_PORT_SPAN || process.env.VSCODE_DATA_BRIDGE_PORT_SPAN;
   const envToken = process.env.DATA_BRIDGE_TOKEN || process.env.VSCODE_DATA_BRIDGE_TOKEN;
   return {
     host: envHost || config.get("host", "127.0.0.1"),
     port: toInteger(envPort, config.get("port", 8765)),
+    portSpan: toInteger(envPortSpan, config.get("portSpan", 20)),
     token: envToken !== undefined ? envToken : config.get("token", ""),
     allowArbitraryCommands: config.get("allowArbitraryCommands", false),
     allowedPrefixes: config.get("allowedCommandPrefixes", [])
@@ -163,6 +211,593 @@ function getServerConfig() {
 
 function log(message) {
   output.appendLine(`[${new Date().toLocaleTimeString()}] ${message}`);
+}
+
+function nonce() {
+  return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function shortPathLabel(value) {
+  if (!value) {
+    return "None";
+  }
+  const normalized = String(value).replace(/^file:\/\/\/?/i, "");
+  const parts = normalized.split(/[\\/]/).filter(Boolean);
+  return parts.length <= 2 ? normalized : parts.slice(-2).join("/");
+}
+
+function maskToken(token) {
+  if (!token) {
+    return "Not set";
+  }
+  if (token.length <= 6) {
+    return `${token.slice(0, 1)}***`;
+  }
+  return `${token.slice(0, 3)}***${token.slice(-2)}`;
+}
+
+const I18N = {
+  en: {
+    none: "None",
+    notSet: "Not set",
+    unavailable: "Unavailable",
+    current: "Current",
+    other: "Other",
+    busy: "busy",
+    idle: "idle",
+    ready: "ready",
+    offline: "offline",
+    controlCenterTitle: "Control Center",
+    currentFocus: "Current focus",
+    notebookUri: "Notebook URI",
+    selection: "Selection",
+    visibleRange: "Visible range",
+    server: "Server",
+    kernelBusy: "Kernel busy",
+    bridgeCompliance: "Bridge compliance",
+    refresh: "Refresh",
+    copyConfig: "Copy Config",
+    showStatus: "Show Status",
+    stopServer: "Stop Server",
+    startServer: "Start Server",
+    servers: "Servers",
+    localBridgeScan: "Local bridge scan across {start}-{end}.",
+    role: "Role",
+    baseUrl: "Base URL",
+    notebook: "Notebook",
+    workspace: "Workspace",
+    noServers: "No bridge servers found.",
+    settings: "Settings",
+    autoStart: "Auto start server",
+    followTargetCell: "Scroll follow current bridge target",
+    allowArbitraryCommands: "Allow arbitrary commands",
+    autoRefresh: "Auto refresh when visible",
+    host: "Host",
+    basePort: "Base port",
+    portSpan: "Port span",
+    refreshInterval: "Refresh interval (ms)",
+    token: "Token",
+    openFullSettings: "Open Full Settings",
+    reloadView: "Reload View",
+    safety: "Safety",
+    fallbackAllowed: "Fallback allowed",
+    mutationRequired: "Mutation required",
+    executionRequired: "Execution required",
+    identityStable: "Identity stable",
+    yes: "yes",
+    no: "no",
+    bridgeRequired: "bridge",
+    optional: "optional",
+    visibleOnlyNote: "Auto refresh only runs while this view is visible."
+  },
+  zh: {
+    none: "无",
+    notSet: "未设置",
+    unavailable: "不可用",
+    current: "当前",
+    other: "其他",
+    busy: "忙碌",
+    idle: "空闲",
+    ready: "就绪",
+    offline: "离线",
+    controlCenterTitle: "控制中心",
+    currentFocus: "当前焦点",
+    notebookUri: "笔记本 URI",
+    selection: "当前选区",
+    visibleRange: "可视范围",
+    server: "当前服务器",
+    kernelBusy: "内核状态",
+    bridgeCompliance: "Bridge 合规状态",
+    refresh: "刷新",
+    copyConfig: "复制配置",
+    showStatus: "显示状态",
+    stopServer: "停止服务",
+    startServer: "启动服务",
+    servers: "服务器列表",
+    localBridgeScan: "本地 Bridge 扫描范围：{start}-{end}",
+    role: "角色",
+    baseUrl: "地址",
+    notebook: "笔记本",
+    workspace: "工作区",
+    noServers: "未发现 Bridge 服务器。",
+    settings: "配置项",
+    autoStart: "自动启动服务",
+    followTargetCell: "滚动跟随当前 Bridge 目标",
+    allowArbitraryCommands: "允许任意命令",
+    autoRefresh: "视图可见时自动刷新",
+    host: "主机",
+    basePort: "基础端口",
+    portSpan: "端口跨度",
+    refreshInterval: "刷新间隔（毫秒）",
+    token: "令牌",
+    openFullSettings: "打开完整设置",
+    reloadView: "重载视图",
+    safety: "安全",
+    fallbackAllowed: "是否允许降级",
+    mutationRequired: "修改要求",
+    executionRequired: "执行要求",
+    identityStable: "身份稳定",
+    yes: "是",
+    no: "否",
+    bridgeRequired: "必须走 bridge",
+    optional: "可选",
+    visibleOnlyNote: "自动刷新只会在当前视图可见时运行。"
+  }
+};
+
+function localeBundle() {
+  const language = String(vscode.env.language || "en").toLowerCase();
+  return language.startsWith("zh") ? I18N.zh : I18N.en;
+}
+
+function t(key, replacements = {}) {
+  const bundle = localeBundle();
+  const template = bundle[key] || I18N.en[key] || key;
+  return Object.entries(replacements).reduce((result, [name, value]) => result.replaceAll(`{${name}}`, String(value)), template);
+}
+
+function controlCenterIntervalMs() {
+  const value = toInteger(getConfig().get("controlCenterRefreshIntervalMs", 3000), 3000);
+  return Math.min(Math.max(value, 1000), 30000);
+}
+
+function configurationTarget() {
+  return vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0
+    ? vscode.ConfigurationTarget.Workspace
+    : vscode.ConfigurationTarget.Global;
+}
+
+function shouldFollowTargetCell(forceReveal = false) {
+  return forceReveal || getConfig().get("followTargetCell", true);
+}
+
+async function updateBridgeSetting(key, value) {
+  await getConfig().update(key, value, configurationTarget());
+}
+
+function currentServerBaseUrl() {
+  const host = bridgeState.server.host || getServerConfig().host;
+  const port = bridgeState.server.port || getServerConfig().port;
+  return `http://${host}:${port}`;
+}
+
+function requestJson(baseUrl, pathname, token) {
+  return new Promise((resolve, reject) => {
+    const url = new URL(pathname, `${baseUrl}/`);
+    const request = http.request(
+      url,
+      {
+        method: "GET",
+        headers: token ? { Authorization: `Bearer ${token}` } : {}
+      },
+      (response) => {
+        let raw = "";
+        response.on("data", (chunk) => {
+          raw += chunk;
+        });
+        response.on("end", () => {
+          if (response.statusCode && response.statusCode >= 400) {
+            reject(new Error(`${response.statusCode} ${response.statusMessage || "Request failed"}`));
+            return;
+          }
+          try {
+            resolve(raw ? JSON.parse(raw) : {});
+          } catch (error) {
+            reject(error);
+          }
+        });
+      }
+    );
+    request.setTimeout(800, () => request.destroy(new Error("timeout")));
+    request.on("error", reject);
+    request.end();
+  });
+}
+
+async function discoverLocalServers() {
+  const config = getServerConfig();
+  const host = bridgeState.server.host || config.host;
+  const basePort = config.port;
+  const portSpan = Math.max(config.portSpan || 1, 1);
+  const token = config.token || "";
+  const currentBaseUrl = currentServerBaseUrl();
+  const candidates = Array.from({ length: portSpan }, (_, index) => ({
+    host,
+    port: basePort + index,
+    baseUrl: `http://${host}:${basePort + index}`
+  }));
+
+  const results = await Promise.all(
+    candidates.map(async (candidate) => {
+      try {
+        const status = await requestJson(candidate.baseUrl, "/status", token);
+        return {
+          ok: true,
+          current: candidate.baseUrl === currentBaseUrl,
+          host: candidate.host,
+          port: candidate.port,
+          baseUrl: candidate.baseUrl,
+          window: status.window || null,
+          notebook: status.notebook || null,
+          compliance: status.compliance || null,
+          server: status.server || null
+        };
+      } catch (error) {
+        return {
+          ok: false,
+          current: candidate.baseUrl === currentBaseUrl,
+          host: candidate.host,
+          port: candidate.port,
+          baseUrl: candidate.baseUrl,
+          error: error.message
+        };
+      }
+    })
+  );
+
+  bridgeState.sidebar.servers = results;
+  bridgeState.sidebar.lastUpdatedAt = new Date().toISOString();
+  return results;
+}
+
+async function controlCenterState() {
+  const config = getServerConfig();
+  const editor = activeNotebookEditor();
+  const servers = await discoverLocalServers();
+  return {
+    generatedAt: new Date().toISOString(),
+    server: {
+      running: Boolean(bridgeServer),
+      host: bridgeState.server.host || config.host,
+      port: bridgeState.server.port || config.port,
+      basePort: config.port,
+      portSpan: config.portSpan,
+      baseUrl: currentServerBaseUrl(),
+      startedAt: bridgeState.server.startedAt || null
+    },
+    notebook: activeNotebookInfo(editor),
+    window: windowIdentity(editor),
+    kernel: kernelState(editor),
+    execution: executionState(editor),
+    compliance: complianceState(editor),
+    settings: {
+      host: config.host,
+      port: config.port,
+      portSpan: config.portSpan,
+      autoStart: config.autoStart !== false,
+      followTargetCell: getConfig().get("followTargetCell", true),
+      controlCenterAutoRefresh: getConfig().get("controlCenterAutoRefresh", true),
+      controlCenterRefreshIntervalMs: controlCenterIntervalMs(),
+      allowArbitraryCommands: config.allowArbitraryCommands,
+      allowedCommandPrefixes: config.allowedPrefixes,
+      tokenIsSet: Boolean(config.token),
+      tokenMasked: maskToken(config.token)
+    },
+    ui: {
+      language: String(vscode.env.language || "en")
+    },
+    servers
+  };
+}
+
+let refreshTimer;
+
+function refreshControlCenterSoon(delay = 150) {
+  if (!controlCenterProvider) {
+    return;
+  }
+  clearTimeout(refreshTimer);
+  refreshTimer = setTimeout(() => {
+    controlCenterProvider.refresh().catch((error) => log(`Control center refresh failed: ${error.stack || error.message}`));
+  }, delay);
+}
+
+class DataBridgeControlCenterProvider {
+  constructor(extensionUri) {
+    this.extensionUri = extensionUri;
+    this.view = null;
+    this.refreshInterval = null;
+  }
+
+  resolveWebviewView(webviewView) {
+    this.view = webviewView;
+    webviewView.webview.options = {
+      enableScripts: true,
+      localResourceRoots: [vscode.Uri.joinPath(this.extensionUri, "media")]
+    };
+    webviewView.onDidDispose(() => {
+      this.stopAutoRefresh();
+      this.view = null;
+    });
+    webviewView.onDidChangeVisibility(() => {
+      this.updateAutoRefresh();
+      if (webviewView.visible) {
+        this.refresh().catch((error) => log(`Control center visible refresh failed: ${error.stack || error.message}`));
+      }
+    });
+    webviewView.webview.onDidReceiveMessage(async (message) => {
+      try {
+        await this.handleMessage(message);
+      } catch (error) {
+        vscode.window.showErrorMessage(`Data Bridge Control Center: ${error.message}`);
+        log(`Control Center message failed: ${error.stack || error.message}`);
+      }
+    });
+    this.refresh().catch((error) => log(`Control center initial render failed: ${error.stack || error.message}`));
+    this.updateAutoRefresh();
+  }
+
+  async handleMessage(message) {
+    switch (message.type) {
+      case "refresh":
+        await this.refresh();
+        return;
+      case "startServer":
+        await startServer();
+        return;
+      case "stopServer":
+        await stopServer();
+        return;
+      case "copyServerConfig":
+        await copyServerConfig();
+        return;
+      case "showStatus":
+        showStatus();
+        return;
+      case "openSettings":
+        await vscode.commands.executeCommand("workbench.action.openSettings", "@ext:local.vscode-data-bridge");
+        return;
+      case "setBoolean":
+        await updateBridgeSetting(message.key, Boolean(message.value));
+        return;
+      case "setNumber": {
+        const numeric = toInteger(message.value);
+        if (numeric === null) {
+          throw new Error(`Invalid numeric value for ${message.key}`);
+        }
+        await updateBridgeSetting(message.key, numeric);
+        return;
+      }
+      case "setText":
+        await updateBridgeSetting(message.key, textValue(message.value));
+        return;
+      default:
+        throw new Error(`Unknown control center action: ${message.type}`);
+    }
+  }
+
+  async refresh() {
+    if (!this.view) {
+      return;
+    }
+    const state = await controlCenterState();
+    this.view.webview.html = this.render(state, this.view.webview);
+    this.updateAutoRefresh();
+  }
+
+  render(state, webview) {
+    const strings = localeBundle();
+    const note = state.notebook;
+    const selection = note.selection && note.selection[0] ? `${note.selection[0].start}-${note.selection[0].end}` : strings.none;
+    const visibleRange = note.visibleRange && note.visibleRange[0] ? `${note.visibleRange[0].start}-${note.visibleRange[0].end}` : strings.none;
+    const rows = state.servers
+      .map((server) => {
+        if (!server.ok) {
+          return `<tr><td>${server.current ? strings.current : strings.other}</td><td>${escapeHtml(server.baseUrl)}</td><td>${strings.unavailable}</td><td>${escapeHtml(server.error || "n/a")}</td></tr>`;
+        }
+        return `<tr><td>${server.current ? strings.current : strings.other}</td><td>${escapeHtml(server.baseUrl)}</td><td>${escapeHtml(shortPathLabel(server.notebook && server.notebook.uri))}</td><td>${escapeHtml(server.window && server.window.workspaceName ? server.window.workspaceName : "n/a")}</td></tr>`;
+      })
+      .join("");
+    const nonceValue = nonce();
+    return `<!DOCTYPE html>
+<html lang="${escapeHtml(state.ui.language || "en")}">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonceValue}';" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <style>
+    body { font-family: var(--vscode-font-family); color: var(--vscode-foreground); padding: 10px 12px 24px; }
+    h2 { font-size: 14px; margin: 14px 0 8px; }
+    .row { display: grid; grid-template-columns: 1fr auto; gap: 8px; margin: 5px 0; align-items: center; }
+    .label { color: var(--vscode-descriptionForeground); }
+    .value { word-break: break-word; text-align: right; }
+    .grid { display: grid; gap: 8px; }
+    .card { border: 1px solid var(--vscode-panel-border); border-radius: 8px; padding: 10px; margin-bottom: 10px; }
+    .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+    button { background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: none; border-radius: 4px; padding: 6px 10px; cursor: pointer; }
+    button.secondary { background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); }
+    input[type="text"], input[type="number"] { width: 100%; box-sizing: border-box; padding: 6px; color: var(--vscode-input-foreground); background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border); border-radius: 4px; }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    td, th { border-bottom: 1px solid var(--vscode-panel-border); padding: 6px 4px; text-align: left; vertical-align: top; }
+    .muted { color: var(--vscode-descriptionForeground); font-size: 12px; }
+    .pill { display: inline-block; padding: 2px 6px; border-radius: 999px; background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); font-size: 11px; }
+    .tableWrap { max-height: 170px; overflow: auto; border: 1px solid var(--vscode-panel-border); border-radius: 6px; margin-top: 8px; }
+    .tableWrap table thead th { position: sticky; top: 0; background: var(--vscode-editor-background); z-index: 1; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="row"><div class="label">${strings.currentFocus}</div><div class="value">${escapeHtml(shortPathLabel(note.uri))}</div></div>
+    <div class="row"><div class="label">${strings.notebookUri}</div><div class="value">${escapeHtml(note.uri || strings.none)}</div></div>
+    <div class="row"><div class="label">${strings.selection}</div><div class="value">${escapeHtml(selection)}</div></div>
+    <div class="row"><div class="label">${strings.visibleRange}</div><div class="value">${escapeHtml(visibleRange)}</div></div>
+    <div class="row"><div class="label">${strings.server}</div><div class="value">${escapeHtml(state.server.baseUrl)}</div></div>
+    <div class="row"><div class="label">${strings.kernelBusy}</div><div class="value">${state.kernel.busy ? `<span class="pill">${strings.busy}</span>` : `<span class="pill">${strings.idle}</span>`}</div></div>
+    <div class="row"><div class="label">${strings.bridgeCompliance}</div><div class="value">${state.compliance.bridgeAvailable ? `<span class="pill">${strings.ready}</span>` : `<span class="pill">${strings.offline}</span>`}</div></div>
+    <div class="actions">
+      <button data-action="refresh">${strings.refresh}</button>
+      <button data-action="copyServerConfig" class="secondary">${strings.copyConfig}</button>
+      <button data-action="showStatus" class="secondary">${strings.showStatus}</button>
+      <button data-action="${state.server.running ? "stopServer" : "startServer"}" class="secondary">${state.server.running ? strings.stopServer : strings.startServer}</button>
+    </div>
+  </div>
+
+  <h2>${strings.servers}</h2>
+  <div class="card">
+    <div class="muted">${escapeHtml(t("localBridgeScan", { start: state.server.basePort, end: state.server.basePort + Math.max(state.server.portSpan - 1, 0) }))}</div>
+    <div class="muted">${strings.visibleOnlyNote}</div>
+    <div class="tableWrap">
+      <table>
+        <thead><tr><th>${strings.role}</th><th>${strings.baseUrl}</th><th>${strings.notebook}</th><th>${strings.workspace}</th></tr></thead>
+        <tbody>${rows || `<tr><td colspan="4">${strings.noServers}</td></tr>`}</tbody>
+      </table>
+    </div>
+  </div>
+
+  <h2>${strings.settings}</h2>
+  <div class="card grid">
+    <label><input type="checkbox" data-setting="autoStart" ${state.settings.autoStart ? "checked" : ""}/> ${strings.autoStart}</label>
+    <label><input type="checkbox" data-setting="followTargetCell" ${state.settings.followTargetCell ? "checked" : ""}/> ${strings.followTargetCell}</label>
+    <label><input type="checkbox" data-setting="controlCenterAutoRefresh" ${state.settings.controlCenterAutoRefresh ? "checked" : ""}/> ${strings.autoRefresh}</label>
+    <label><input type="checkbox" data-setting="allowArbitraryCommands" ${state.settings.allowArbitraryCommands ? "checked" : ""}/> ${strings.allowArbitraryCommands}</label>
+    <div>
+      <div class="muted">${strings.host}</div>
+      <input type="text" data-text-setting="host" value="${escapeHtml(state.settings.host)}" />
+    </div>
+    <div>
+      <div class="muted">${strings.basePort}</div>
+      <input type="number" data-number-setting="port" value="${escapeHtml(String(state.settings.port))}" />
+    </div>
+    <div>
+      <div class="muted">${strings.portSpan}</div>
+      <input type="number" data-number-setting="portSpan" value="${escapeHtml(String(state.settings.portSpan))}" />
+    </div>
+    <div>
+      <div class="muted">${strings.refreshInterval}</div>
+      <input type="number" data-number-setting="controlCenterRefreshIntervalMs" value="${escapeHtml(String(state.settings.controlCenterRefreshIntervalMs))}" />
+    </div>
+    <div>
+      <div class="muted">${strings.token}</div>
+      <input type="text" data-text-setting="token" value="" placeholder="${escapeHtml(state.settings.tokenIsSet ? state.settings.tokenMasked : strings.notSet)}" />
+    </div>
+    <div class="actions">
+      <button data-action="openSettings" class="secondary">${strings.openFullSettings}</button>
+      <button data-action="refresh" class="secondary">${strings.reloadView}</button>
+    </div>
+  </div>
+
+  <h2>${strings.safety}</h2>
+  <div class="card">
+    <div class="row"><div class="label">${strings.fallbackAllowed}</div><div class="value">${state.compliance.fallbackAllowed ? strings.yes : strings.no}</div></div>
+    <div class="row"><div class="label">${strings.mutationRequired}</div><div class="value">${state.compliance.bridgeMutationRequired ? strings.bridgeRequired : strings.optional}</div></div>
+    <div class="row"><div class="label">${strings.executionRequired}</div><div class="value">${state.compliance.bridgeExecutionRequired ? strings.bridgeRequired : strings.optional}</div></div>
+    <div class="row"><div class="label">${strings.identityStable}</div><div class="value">${state.compliance.activeNotebookIdentityStable ? strings.yes : strings.no}</div></div>
+  </div>
+
+  <script nonce="${nonceValue}">
+    const vscode = acquireVsCodeApi();
+    document.querySelectorAll('[data-action]').forEach((button) => {
+      button.addEventListener('click', () => vscode.postMessage({ type: button.dataset.action }));
+    });
+    document.querySelectorAll('[data-setting]').forEach((input) => {
+      input.addEventListener('change', () => vscode.postMessage({
+        type: 'setBoolean',
+        key: input.dataset.setting,
+        value: input.checked
+      }));
+    });
+    document.querySelectorAll('[data-number-setting]').forEach((input) => {
+      input.addEventListener('change', () => vscode.postMessage({
+        type: 'setNumber',
+        key: input.dataset.numberSetting,
+        value: input.value
+      }));
+    });
+    document.querySelectorAll('[data-text-setting]').forEach((input) => {
+      input.addEventListener('change', () => vscode.postMessage({
+        type: 'setText',
+        key: input.dataset.textSetting,
+        value: input.value
+      }));
+    });
+  </script>
+</body>
+</html>`;
+  }
+
+  updateAutoRefresh() {
+    if (!this.view) {
+      this.stopAutoRefresh();
+      return;
+    }
+    const enabled = getConfig().get("controlCenterAutoRefresh", true);
+    if (!enabled || !this.view.visible) {
+      this.stopAutoRefresh();
+      return;
+    }
+    const intervalMs = controlCenterIntervalMs();
+    if (this.refreshInterval && this.refreshInterval.intervalMs === intervalMs) {
+      return;
+    }
+    this.stopAutoRefresh();
+    const handle = setInterval(() => {
+      if (!this.view || !this.view.visible) {
+        return;
+      }
+      this.refresh().catch((error) => log(`Control center auto-refresh failed: ${error.stack || error.message}`));
+    }, intervalMs);
+    this.refreshInterval = { handle, intervalMs };
+  }
+
+  stopAutoRefresh() {
+    if (this.refreshInterval) {
+      clearInterval(this.refreshInterval.handle);
+      this.refreshInterval = null;
+    }
+  }
+}
+
+async function openControlCenter() {
+  await vscode.commands.executeCommand("workbench.view.extension.dataBridgeSidebar");
+  refreshControlCenterSoon(0);
+}
+
+async function refreshControlCenter() {
+  if (controlCenterProvider) {
+    await controlCenterProvider.refresh();
+  }
+}
+
+async function handleConfigurationChange(event) {
+  const serverRelevantKeys = [
+    "dataBridge.host",
+    "dataBridge.port",
+    "dataBridge.portSpan",
+    "dataBridge.token"
+  ];
+  if (bridgeServer && serverRelevantKeys.some((key) => event.affectsConfiguration(key))) {
+    await stopServer();
+    await startServer();
+  }
 }
 
 function textValue(value, fallback = "") {
@@ -217,6 +852,10 @@ function notebookLanguage(kind) {
 
 function serializeRange(range) {
   return { start: range.start, end: range.end };
+}
+
+function selectionSnapshot(editor) {
+  return editor ? editor.selections.map((range) => serializeRange(range)) : [];
 }
 
 function decodeOutputItem(item) {
@@ -281,6 +920,27 @@ function notebookUri(editorOrNotebook) {
   return notebook && notebook.uri ? notebook.uri.toString() : null;
 }
 
+function workspaceRoots() {
+  return (vscode.workspace.workspaceFolders || []).map((folder) => ({
+    name: folder.name,
+    uri: folder.uri.toString(),
+    path: folder.uri.fsPath
+  }));
+}
+
+function windowIdentity(editor = activeNotebookEditor()) {
+  const roots = workspaceRoots();
+  const notebook = activeNotebookInfo(editor);
+  return {
+    workspaceName: vscode.workspace.name || null,
+    rootPaths: roots.map((root) => root.path),
+    rootUris: roots.map((root) => root.uri),
+    activeNotebookUri: notebook.uri,
+    notebookType: notebook.notebookType,
+    hasActiveNotebook: notebook.hasActiveNotebook
+  };
+}
+
 function notebookRuntimeRecord(uri) {
   if (!uri) {
     return null;
@@ -302,10 +962,28 @@ function notebookRuntimeRecord(uri) {
       pendingTargets: [],
       lastObservedExecutionOrder: null,
       lastObservedCellIds: [],
-      lastObservedNotebookVersion: 0
+      lastObservedNotebookVersion: 0,
+      lastObservedMutationAt: null,
+      lastMutationCellIds: [],
+      completionObservedAt: null,
+      outputObservedAt: null,
+      idleObservedAt: null,
+      identityDrifted: false,
+      driftedAt: null,
+      driftReason: null,
+      selectionSnapshot: []
     };
   }
   return bridgeState.notebookRuntime[uri];
+}
+
+function notebookVersionToken(editor = activeNotebookEditor()) {
+  const uri = notebookUri(editor);
+  const runtime = notebookRuntimeRecord(uri);
+  if (!uri || !runtime) {
+    return null;
+  }
+  return `${uri}#${runtime.lastObservedNotebookVersion}`;
 }
 
 function activeRuntime(editor = activeNotebookEditor()) {
@@ -318,11 +996,68 @@ function updateActiveNotebookIdentity(editor, reason) {
   bridgeState.activeNotebook.uri = uri;
   bridgeState.activeNotebook.switchedAt = new Date().toISOString();
   bridgeState.activeNotebook.switchCount += 1;
+  bridgeState.activeNotebook.selectionSnapshot = selectionSnapshot(editor);
   const runtime = notebookRuntimeRecord(uri);
   if (runtime) {
     runtime.lastActivatedAt = bridgeState.activeNotebook.switchedAt;
     runtime.lastIdentityReason = reason;
     runtime.lastSelectionSeenAt = editor && editor.selections ? new Date().toISOString() : runtime.lastSelectionSeenAt;
+    runtime.selectionSnapshot = selectionSnapshot(editor);
+  }
+  bridgeState.activeNotebook.versionToken = notebookVersionToken(editor);
+  observeIdentityDrift(editor, reason);
+}
+
+function updateSelectionObservation(editor, reason) {
+  const uri = notebookUri(editor);
+  const runtime = notebookRuntimeRecord(uri);
+  const snapshot = selectionSnapshot(editor);
+  bridgeState.activeNotebook.selectionSnapshot = snapshot;
+  bridgeState.activeNotebook.versionToken = notebookVersionToken(editor);
+  if (runtime) {
+    runtime.lastSelectionSeenAt = new Date().toISOString();
+    runtime.selectionSnapshot = snapshot;
+  }
+  observeIdentityDrift(editor, reason);
+}
+
+function targetMatchesSelection(editor, target) {
+  if (!editor || !target) {
+    return true;
+  }
+  if (target.selection === "current" || target.scope === "all") {
+    return true;
+  }
+  const current = editor.selections && editor.selections[0];
+  if (!current) {
+    return false;
+  }
+  if (typeof target.index === "number") {
+    return current.start <= target.index && current.end > target.index;
+  }
+  return true;
+}
+
+function observeIdentityDrift(editor, reason) {
+  const lastExecution = bridgeState.lastExecution;
+  if (!lastExecution || !lastExecution.pendingObservation) {
+    return;
+  }
+  const currentUri = notebookUri(editor);
+  const runtime = notebookRuntimeRecord(lastExecution.notebookUri);
+  if (!runtime) {
+    return;
+  }
+  const uriDrifted = currentUri !== lastExecution.notebookUri;
+  const selectionDrifted = currentUri === lastExecution.notebookUri && !targetMatchesSelection(editor, lastExecution.target);
+  if (uriDrifted || selectionDrifted) {
+    const driftedAt = new Date().toISOString();
+    runtime.identityDrifted = true;
+    runtime.driftedAt = driftedAt;
+    runtime.driftReason = uriDrifted ? "active-notebook-changed" : reason || "selection-changed";
+    lastExecution.identityStable = false;
+    lastExecution.identityDrifted = true;
+    lastExecution.identityDriftedAt = driftedAt;
   }
 }
 
@@ -336,25 +1071,41 @@ function updateNotebookRuntimeFromEvent(event) {
   runtime.statusKnown = true;
   runtime.lastDocumentChangeAt = changedAt;
   runtime.lastObservedNotebookVersion += 1;
+  bridgeState.activeNotebook.versionToken = notebookVersionToken(activeNotebookEditor());
   const outputChanged = event.cellChanges.some((change) => Array.isArray(change.outputs) && change.outputs.length >= 0);
   const executionChanged = event.cellChanges.some((change) => change.executionSummary !== undefined);
 
   if (outputChanged) {
     runtime.outputChangeCount += 1;
     runtime.lastOutputChangeAt = changedAt;
+    runtime.outputObservedAt = changedAt;
+    if (bridgeState.lastExecution && bridgeState.lastExecution.notebookUri === uri) {
+      bridgeState.lastExecution.outputObserved = true;
+      bridgeState.lastExecution.outputObservedAt = changedAt;
+    }
   }
 
   if (executionChanged) {
     runtime.executionChangeCount += 1;
     runtime.lastExecutionCompletedAt = changedAt;
+    runtime.completionObservedAt = changedAt;
     runtime.busy = false;
     runtime.pendingTargets = [];
+    runtime.idleObservedAt = changedAt;
     if (bridgeState.lastExecution && bridgeState.lastExecution.notebookUri === uri) {
       bridgeState.lastExecution.pendingObservation = false;
       bridgeState.lastExecution.completedAt = changedAt;
+      bridgeState.lastExecution.completionObserved = true;
+      bridgeState.lastExecution.identityStable = !runtime.identityDrifted;
     }
   } else if (outputChanged && runtime.pendingTargets.length > 0) {
     runtime.busy = true;
+  }
+
+  if ((outputChanged || executionChanged) && bridgeState.lastMutation && bridgeState.lastMutation.notebookUri === uri) {
+    runtime.lastObservedMutationAt = changedAt;
+    bridgeState.lastMutation.lastMutationObservedAt = changedAt;
+    bridgeState.lastMutation.lastMutationApplied = true;
   }
 
   const observedCells = event.cellChanges
@@ -362,6 +1113,7 @@ function updateNotebookRuntimeFromEvent(event) {
     .map((change) => cellId(change.cell));
   if (observedCells.length > 0) {
     runtime.lastObservedCellIds = observedCells;
+    runtime.lastMutationCellIds = observedCells;
   }
 
   const observedExecutionOrder = event.cellChanges
@@ -404,13 +1156,27 @@ function activeNotebookInfo(editor = activeNotebookEditor()) {
     visibleRange: editor ? editor.visibleRanges.map((range) => serializeRange(range)) : [],
     selection: editor ? editor.selections.map((range) => serializeRange(range)) : [],
     identity: {
+      uri: bridgeState.activeNotebook.uri,
       activeUri: bridgeState.activeNotebook.uri,
+      versionToken: notebookVersionToken(editor),
       switchedAt: bridgeState.activeNotebook.switchedAt,
       switchCount: bridgeState.activeNotebook.switchCount,
       visibleEditors: bridgeState.activeNotebook.visibleEditors,
+      selectionSnapshot: selectionSnapshot(editor),
       lastActivatedAt: runtime ? runtime.lastActivatedAt : null,
       lastIdentityReason: runtime ? runtime.lastIdentityReason : null
     }
+  };
+}
+
+function mutationState(editor = activeNotebookEditor()) {
+  const runtime = activeRuntime(editor);
+  return {
+    lastMutation: bridgeState.lastMutation,
+    lastMutationTarget: bridgeState.lastMutation ? bridgeState.lastMutation.target || null : null,
+    lastMutationApplied: Boolean(bridgeState.lastMutation && bridgeState.lastMutation.lastMutationApplied),
+    lastMutationObservedAt: runtime ? runtime.lastObservedMutationAt : null,
+    lastMutationSource: bridgeState.lastMutation ? bridgeState.lastMutation.source || "bridge" : null
   };
 }
 
@@ -425,6 +1191,7 @@ function kernelState(editor = activeNotebookEditor()) {
     executionRequestedAt: runtime ? runtime.executionRequestedAt : null,
     lastExecutionCompletedAt: runtime ? runtime.lastExecutionCompletedAt : null,
     lastOutputChangeAt: runtime ? runtime.lastOutputChangeAt : null,
+    idleObservedAt: runtime ? runtime.idleObservedAt : null,
     pendingTargets: runtime ? runtime.pendingTargets : [],
     lastKernelAction: bridgeState.lastKernelAction,
     lastExecution: bridgeState.lastExecution
@@ -448,9 +1215,21 @@ function debugState(editor = activeNotebookEditor()) {
 
 function executionState(editor = activeNotebookEditor()) {
   const runtime = activeRuntime(editor);
+  const inferred = inferredExecutionObservation(editor);
   return {
     notebook: activeNotebookInfo(editor),
     kernel: kernelState(editor),
+    requestedAt: bridgeState.lastExecution ? bridgeState.lastExecution.at : null,
+    pending: Boolean(runtime && runtime.busy),
+    pendingTargets: runtime ? runtime.pendingTargets : [],
+    completedAt: bridgeState.lastExecution ? bridgeState.lastExecution.completedAt || null : null,
+    completionObserved: inferred.completionObserved,
+    outputObserved: inferred.outputObserved,
+    outputObservedAt: inferred.outputObservedAt,
+    busy: Boolean(runtime && runtime.busy),
+    idleObservedAt: runtime ? runtime.idleObservedAt : null,
+    identityStable: inferred.identityStable,
+    identityDrifted: Boolean(bridgeState.lastExecution && bridgeState.lastExecution.identityDrifted),
     lastExecution: bridgeState.lastExecution,
     pendingObservation: Boolean(bridgeState.lastExecution && bridgeState.lastExecution.pendingObservation),
     observed: runtime
@@ -459,9 +1238,32 @@ function executionState(editor = activeNotebookEditor()) {
           outputChangeCount: runtime.outputChangeCount,
           lastDocumentChangeAt: runtime.lastDocumentChangeAt,
           lastObservedExecutionOrder: runtime.lastObservedExecutionOrder,
-          lastObservedCellIds: runtime.lastObservedCellIds
+          lastObservedCellIds: runtime.lastObservedCellIds,
+          completionObservedAt: runtime.completionObservedAt,
+          outputObservedAt: runtime.outputObservedAt,
+          identityDrifted: runtime.identityDrifted,
+          driftedAt: runtime.driftedAt,
+          driftReason: runtime.driftReason
         }
       : null
+  };
+}
+
+function complianceState(editor = activeNotebookEditor()) {
+  const runtime = activeRuntime(editor);
+  const execution = bridgeState.lastExecution;
+  const inferred = inferredExecutionObservation(editor);
+  return {
+    bridgeAvailable: Boolean(bridgeServer),
+    bridgeMutationRequired: true,
+    bridgeExecutionRequired: true,
+    fallbackAllowed: false,
+    fallbackReason: null,
+    activeNotebookIdentityStable: Boolean(!runtime || !runtime.identityDrifted),
+    lastMutationBridgeConfirmed: Boolean(bridgeState.lastMutation && bridgeState.lastMutation.lastMutationApplied),
+    lastExecutionBridgeConfirmed: Boolean(execution && inferred.completionObserved && inferred.outputObserved && inferred.identityStable),
+    lastMutationSource: bridgeState.lastMutation ? bridgeState.lastMutation.source || "bridge" : null,
+    lastExecutionSource: execution ? "bridge" : null
   };
 }
 
@@ -470,8 +1272,12 @@ function capabilities() {
     endpoints: DEFAULT_ENDPOINTS,
     commands: QUICK_COMMANDS,
     supports: {
+      serverDiscovery: true,
       notebookState: true,
+      multiWindowDiscovery: true,
+      compliance: true,
       cellCrud: true,
+      workflowOps: true,
       execution: true,
       debugCommands: true,
       outputRead: true,
@@ -515,6 +1321,10 @@ function okResponse(operation, payload = {}) {
     operation,
     notebook: activeNotebookInfo(),
     kernel: kernelState(),
+    mutation: mutationState(),
+    execution: executionState(),
+    compliance: complianceState(),
+    window: windowIdentity(),
     ...payload
   };
 }
@@ -630,6 +1440,60 @@ function findCell(editor, locator = {}, options = {}) {
   throw structuredError("CELL_LOCATOR_REQUIRED", "A cell locator is required");
 }
 
+function resolveCellFromTarget(editor, target) {
+  if (!editor || !target) {
+    return null;
+  }
+  try {
+    if (typeof target.index === "number") {
+      return findCell(editor, { index: target.index });
+    }
+    if (target.id) {
+      return findCell(editor, { id: target.id });
+    }
+    if (target.selection === "current") {
+      return findCell(editor, { selection: "current" });
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+function hasCellOutputs(cell) {
+  return Boolean(cell && Array.isArray(cell.outputs) && cell.outputs.length > 0);
+}
+
+function inferredExecutionObservation(editor = activeNotebookEditor()) {
+  const execution = bridgeState.lastExecution;
+  if (!editor || !execution || execution.notebookUri !== notebookUri(editor)) {
+    return {
+      completionObserved: Boolean(execution && execution.completionObserved),
+      outputObserved: Boolean(execution && execution.outputObserved),
+      outputObservedAt: execution ? execution.outputObservedAt || null : null,
+      identityStable: execution ? execution.identityStable !== false : true
+    };
+  }
+
+  const runtime = activeRuntime(editor);
+  const target = resolveCellFromTarget(editor, execution.target);
+  const completionObserved = Boolean(execution.completionObserved || (runtime && runtime.completionObservedAt));
+  const outputObserved = Boolean(execution.outputObserved || (target && hasCellOutputs(target.cell)));
+  const outputObservedAt = execution.outputObservedAt || (outputObserved && runtime ? runtime.outputObservedAt || runtime.lastDocumentChangeAt : null);
+
+  if (outputObserved && !execution.outputObserved) {
+    execution.outputObserved = true;
+    execution.outputObservedAt = outputObservedAt;
+  }
+
+  return {
+    completionObserved,
+    outputObserved,
+    outputObservedAt,
+    identityStable: execution.identityStable !== false
+  };
+}
+
 function cloneCellData(cell, overrides = {}) {
   const nextKind = notebookKind(overrides.kind ?? cell.kind);
   const nextSource = normalizeSource(overrides.source ?? cell.document.getText());
@@ -642,7 +1506,7 @@ function cloneCellData(cell, overrides = {}) {
 
 async function applyNotebookCellReplacement(editor, start, end, cellData) {
   const edit = new vscode.WorkspaceEdit();
-  edit.replaceNotebookCells(editor.notebook.uri, new vscode.NotebookRange(start, end), cellData);
+  edit.set(editor.notebook.uri, [vscode.NotebookEdit.replaceCells(new vscode.NotebookRange(start, end), cellData)]);
   const applied = await vscode.workspace.applyEdit(edit);
   if (!applied) {
     throw structuredError("EDIT_REJECTED", "Notebook edit was rejected");
@@ -661,7 +1525,7 @@ async function applyNotebookMetadataEdit(editor, notebookEdits) {
 async function selectCell(editor, index, options = {}) {
   const range = new vscode.NotebookRange(index, index + 1);
   editor.selections = [range];
-  if (options.reveal !== false) {
+  if (options.reveal !== false && shouldFollowTargetCell(options.forceReveal)) {
     editor.revealRange(range);
   }
   return range;
@@ -726,13 +1590,22 @@ async function executeCommand(commandId, args = [], meta = {}) {
       at: new Date().toISOString(),
       target: meta.target || null,
       pendingObservation: true,
-      notebookUri: currentUri
+      notebookUri: currentUri,
+      completionObserved: false,
+      outputObserved: false,
+      outputObservedAt: null,
+      completedAt: null,
+      identityStable: true,
+      identityDrifted: false
     };
     if (runtime) {
       runtime.statusKnown = true;
       runtime.busy = true;
       runtime.executionRequestedAt = bridgeState.lastExecution.at;
       runtime.pendingTargets = meta.target ? [meta.target] : [];
+      runtime.identityDrifted = false;
+      runtime.driftedAt = null;
+      runtime.driftReason = null;
     }
   }
   if (meta.kind === "debug") {
@@ -824,11 +1697,25 @@ async function insertCell(payload, append = false) {
   cellData.metadata = payload.metadata || {};
   cellData.outputs = [];
   await applyNotebookCellReplacement(editor, index, index, [cellData]);
-  bridgeState.lastMutation = { operation: append ? "cell.append" : "cell.insert", at: new Date().toISOString(), index };
+  bridgeState.lastMutation = {
+    operation: append ? "cell.append" : "cell.insert",
+    at: new Date().toISOString(),
+    notebookUri: notebookUri(editor),
+    target: { index },
+    index,
+    source: "bridge",
+    lastMutationApplied: true,
+    lastMutationObservedAt: new Date().toISOString()
+  };
   const updatedEditor = getEditorOrThrow();
   const insertedCell = updatedEditor.notebook.cellAt(index);
+  if (shouldFollowTargetCell(false)) {
+    await selectCell(updatedEditor, index, { reveal: true });
+  }
   return okResponse(append ? "cell.append" : "cell.insert", {
     cell: serializeCell(insertedCell, index),
+    applied: true,
+    identityStable: true,
     summary: `${append ? "Appended" : "Inserted"} cell at ${index}`
   });
 }
@@ -842,10 +1729,24 @@ async function updateCell(payload) {
     metadata: payload.metadata !== undefined ? payload.metadata : target.cell.metadata
   });
   await applyNotebookCellReplacement(editor, target.index, target.index + 1, [nextData]);
-  bridgeState.lastMutation = { operation: "cell.update", at: new Date().toISOString(), index: target.index };
+  bridgeState.lastMutation = {
+    operation: "cell.update",
+    at: new Date().toISOString(),
+    notebookUri: notebookUri(editor),
+    target: { index: target.index, id: cellId(target.cell) },
+    index: target.index,
+    source: "bridge",
+    lastMutationApplied: true,
+    lastMutationObservedAt: new Date().toISOString()
+  };
   const refreshedCell = getEditorOrThrow().notebook.cellAt(target.index);
+  if (shouldFollowTargetCell(false)) {
+    await selectCell(getEditorOrThrow(), target.index, { reveal: true });
+  }
   return okResponse("cell.update", {
     cell: serializeCell(refreshedCell, target.index),
+    applied: true,
+    identityStable: true,
     summary: `Updated cell ${target.index}`
   });
 }
@@ -870,7 +1771,16 @@ async function deleteCells(payload) {
     const index = uniqueIndexes[i];
     await applyNotebookCellReplacement(editor, index, index + 1, []);
   }
-  bridgeState.lastMutation = { operation: "cell.delete", at: new Date().toISOString(), indexes: uniqueIndexes };
+  bridgeState.lastMutation = {
+    operation: "cell.delete",
+    at: new Date().toISOString(),
+    notebookUri: notebookUri(editor),
+    target: { indexes: uniqueIndexes },
+    indexes: uniqueIndexes,
+    source: "bridge",
+    lastMutationApplied: true,
+    lastMutationObservedAt: new Date().toISOString()
+  };
   return okResponse("cell.delete", {
     result: { deletedIndexes: uniqueIndexes },
     summary: `Deleted ${uniqueIndexes.length} cell(s)`
@@ -896,7 +1806,20 @@ async function moveCell(payload) {
   const [moved] = cellDatas.splice(target.index, 1);
   cellDatas.splice(destinationIndex, 0, moved);
   await applyNotebookCellReplacement(editor, 0, allCells.length, cellDatas);
-  bridgeState.lastMutation = { operation: "cell.move", at: new Date().toISOString(), from: target.index, to: destinationIndex };
+  bridgeState.lastMutation = {
+    operation: "cell.move",
+    at: new Date().toISOString(),
+    notebookUri: notebookUri(editor),
+    target: { from: target.index, to: destinationIndex, id: cellId(target.cell) },
+    from: target.index,
+    to: destinationIndex,
+    source: "bridge",
+    lastMutationApplied: true,
+    lastMutationObservedAt: new Date().toISOString()
+  };
+  if (shouldFollowTargetCell(false)) {
+    await selectCell(getEditorOrThrow(), destinationIndex, { reveal: true });
+  }
   return okResponse("cell.move", {
     result: { from: target.index, to: destinationIndex },
     summary: `Moved cell ${target.index} to ${destinationIndex}`
@@ -909,8 +1832,21 @@ async function duplicateCell(payload) {
   const duplicate = cloneCellData(target.cell);
   const insertIndex = toInteger(payload.toIndex, target.index + 1);
   await applyNotebookCellReplacement(editor, insertIndex, insertIndex, [duplicate]);
-  bridgeState.lastMutation = { operation: "cell.duplicate", at: new Date().toISOString(), from: target.index, to: insertIndex };
+  bridgeState.lastMutation = {
+    operation: "cell.duplicate",
+    at: new Date().toISOString(),
+    notebookUri: notebookUri(editor),
+    target: { from: target.index, to: insertIndex, id: cellId(target.cell) },
+    from: target.index,
+    to: insertIndex,
+    source: "bridge",
+    lastMutationApplied: true,
+    lastMutationObservedAt: new Date().toISOString()
+  };
   const inserted = getEditorOrThrow().notebook.cellAt(insertIndex);
+  if (shouldFollowTargetCell(false)) {
+    await selectCell(getEditorOrThrow(), insertIndex, { reveal: true });
+  }
   return okResponse("cell.duplicate", {
     cell: serializeCell(inserted, insertIndex),
     summary: `Duplicated cell ${target.index} to ${insertIndex}`
@@ -924,7 +1860,9 @@ async function selectTargetCell(payload, revealOnly = false) {
   if (!revealOnly) {
     editor.selections = [range];
   }
-  editor.revealRange(range);
+  if (revealOnly || shouldFollowTargetCell(true)) {
+    editor.revealRange(range);
+  }
   return okResponse(revealOnly ? "cell.reveal" : "cell.select", {
     cell: serializeCell(target.cell, target.index),
     selection: activeNotebookInfo(editor).selection,
@@ -937,8 +1875,20 @@ async function replaceOutputs(payload) {
   const target = findCell(editor, payload);
   const outputs = buildOutputs(payload.outputs || []);
   await applyNotebookMetadataEdit(editor, [vscode.NotebookEdit.updateCellOutputs(target.index, outputs)]);
-  bridgeState.lastMutation = { operation: "cell.replaceOutputs", at: new Date().toISOString(), index: target.index };
+  bridgeState.lastMutation = {
+    operation: "cell.replaceOutputs",
+    at: new Date().toISOString(),
+    notebookUri: notebookUri(editor),
+    target: { index: target.index, id: cellId(target.cell) },
+    index: target.index,
+    source: "bridge",
+    lastMutationApplied: true,
+    lastMutationObservedAt: new Date().toISOString()
+  };
   const refreshedCell = getEditorOrThrow().notebook.cellAt(target.index);
+  if (shouldFollowTargetCell(false)) {
+    await selectCell(getEditorOrThrow(), target.index, { reveal: true });
+  }
   return okResponse("cell.replaceOutputs", {
     cell: serializeCell(refreshedCell, target.index),
     summary: `Replaced outputs for cell ${target.index}`
@@ -949,7 +1899,16 @@ async function clearOutputs(payload) {
   const editor = getEditorOrThrow();
   if (toBoolean(payload.all, false)) {
     await executeCommand("notebook.clearAllCellsOutputs", [], { kind: "notebook" });
-    bridgeState.lastMutation = { operation: "cell.clearOutputs", at: new Date().toISOString(), all: true };
+    bridgeState.lastMutation = {
+      operation: "cell.clearOutputs",
+      at: new Date().toISOString(),
+      notebookUri: notebookUri(editor),
+      target: { all: true },
+      all: true,
+      source: "bridge",
+      lastMutationApplied: true,
+      lastMutationObservedAt: new Date().toISOString()
+    };
     return okResponse("cell.clearOutputs", {
       result: { all: true },
       summary: "Cleared outputs for all cells"
@@ -960,7 +1919,16 @@ async function clearOutputs(payload) {
     payload,
     async (target) => {
       await executeCommand("notebook.cell.clearOutputs", [], { kind: "notebook" });
-      bridgeState.lastMutation = { operation: "cell.clearOutputs", at: new Date().toISOString(), index: target.index };
+      bridgeState.lastMutation = {
+        operation: "cell.clearOutputs",
+        at: new Date().toISOString(),
+        notebookUri: notebookUri(editor),
+        target: { index: target.index, id: cellId(target.cell) },
+        index: target.index,
+        source: "bridge",
+        lastMutationApplied: true,
+        lastMutationObservedAt: new Date().toISOString()
+      };
       const refreshed = getEditorOrThrow().notebook.cellAt(target.index);
       return okResponse("cell.clearOutputs", {
         cell: serializeCell(refreshed, target.index),
@@ -978,6 +1946,9 @@ async function runNotebookCommandWithLocator(operation, commandId, payload, opti
     return okResponse(operation, {
       accepted: true,
       pendingObservation: true,
+      completionObserved: false,
+      outputObserved: false,
+      identityStable: true,
       selection: activeNotebookInfo(editor).selection,
       summary: `Execution requested with ${commandId}`
     });
@@ -994,6 +1965,9 @@ async function runNotebookCommandWithLocator(operation, commandId, payload, opti
         cell: serializeCell(target.cell, target.index),
         accepted: true,
         pendingObservation: true,
+        completionObserved: false,
+        outputObserved: false,
+        identityStable: true,
         selection: activeNotebookInfo(editor).selection,
         summary: `Execution requested for cell ${target.index}`
       });
@@ -1059,14 +2033,84 @@ async function kernelShutdown() {
   throw structuredError("KERNEL_SHUTDOWN_UNSUPPORTED", "VS Code does not expose a supported public command for shutting down the current notebook kernel");
 }
 
+async function workflowUpdateAndRun(body) {
+  const update = await updateCell(body);
+  if (toBoolean(body.clearOutputs, false)) {
+    await clearOutputs(body);
+  }
+  const execution = body.useCurrentSelection ? await runNotebookCommandWithLocator("workflow.updateAndRun", "notebook.cell.execute", body, { useCurrentSelection: true }) : await runNotebookCommandWithLocator("workflow.updateAndRun", "notebook.cell.execute", body);
+  const output = await readOutput(body);
+  return okResponse("workflow.updateAndRun", {
+    mutation: update.mutation,
+    execution: execution.execution,
+    cell: output.cell,
+    result: {
+      mutationApplied: update.applied === true,
+      executionAccepted: execution.accepted === true,
+      hasOutputs: output.hasOutputs
+    },
+    summary: "Updated and executed target cell through bridge"
+  });
+}
+
+async function workflowInsertAndRun(body) {
+  const insert = body.append ? await insertCell(body, true) : await insertCell(body, false);
+  const targetIndex = insert.cell.index;
+  if (toBoolean(body.clearOutputs, false)) {
+    await clearOutputs({ index: targetIndex });
+  }
+  const execution = await runNotebookCommandWithLocator("workflow.insertAndRun", "notebook.cell.execute", { index: targetIndex });
+  const output = await readOutput({ index: targetIndex });
+  return okResponse("workflow.insertAndRun", {
+    mutation: insert.mutation,
+    execution: execution.execution,
+    cell: output.cell,
+    result: {
+      insertedIndex: targetIndex,
+      mutationApplied: insert.applied === true,
+      executionAccepted: execution.accepted === true,
+      hasOutputs: output.hasOutputs
+    },
+    summary: "Inserted and executed target cell through bridge"
+  });
+}
+
+async function readOutput(locator) {
+  const active = getEditorOrThrow();
+  const target = findCell(active, locator);
+  const cell = serializeCell(target.cell, target.index, {
+    includeSource: false,
+    includeMetadata: false,
+    includeOutputs: true,
+    outputTextLimit: 4000
+  });
+  const runtime = activeRuntime(active);
+  const hasOutputs = Array.isArray(cell.outputs) && cell.outputs.length > 0;
+  const inferred = inferredExecutionObservation(active);
+  const observedFromBridgeExecution = Boolean(
+    bridgeState.lastExecution &&
+    bridgeState.lastExecution.notebookUri === notebookUri(active) &&
+    inferred.outputObserved &&
+    (!runtime || runtime.lastObservedCellIds.length === 0 || runtime.lastObservedCellIds.includes(cell.id))
+  );
+  return okResponse("output", {
+    cell,
+    hasOutputs,
+    observedFromBridgeExecution,
+    summary: `Collected outputs for cell ${target.index}`
+  });
+}
+
 async function httpGet(url) {
   const editor = activeNotebookEditor();
   switch (url.pathname) {
     case "/status":
       return okResponse("status", {
         server: {
-          host: getServerConfig().host,
-          port: getServerConfig().port,
+          host: bridgeState.server.host || getServerConfig().host,
+          port: bridgeState.server.port || getServerConfig().port,
+          basePort: getServerConfig().port,
+          portSpan: getServerConfig().portSpan,
           allowArbitraryCommands: getServerConfig().allowArbitraryCommands
         },
         commands: QUICK_COMMANDS,
@@ -1074,12 +2118,19 @@ async function httpGet(url) {
         execution: executionState(editor),
         debug: debugState(editor)
       });
+    case "/servers":
+      return okResponse("servers", {
+        servers: await discoverLocalServers(),
+        summary: "Collected local bridge server list"
+      });
     case "/commands": {
       const includeAll = url.searchParams.get("all") === "1";
       return okResponse("commands", { commands: includeAll ? await getAllCommands() : QUICK_COMMANDS });
     }
     case "/capabilities":
       return okResponse("capabilities", capabilities());
+    case "/compliance":
+      return okResponse("compliance", { compliance: complianceState(editor) });
     case "/notebook": {
       const active = getEditorOrThrow();
       return okResponse("notebook", summarizeNotebook(active, {
@@ -1118,7 +2169,9 @@ async function httpGet(url) {
         context: {
           notebook: activeNotebookInfo(active),
           kernel: kernelState(active),
+          mutation: mutationState(active),
           execution: executionState(active),
+          compliance: complianceState(active),
           cells: getNotebookCells(active).map((cell, index) => serializeCell(cell, index, {
             includeSource: toBoolean(url.searchParams.get("includeSource"), true),
             includeMetadata: toBoolean(url.searchParams.get("includeMetadata"), true),
@@ -1133,22 +2186,12 @@ async function httpGet(url) {
     case "/kernel/state":
       return okResponse("kernel.state", { kernel: kernelState(editor) });
     case "/output": {
-      const active = getEditorOrThrow();
-      const target = findCell(active, {
+      return readOutput({
         index: url.searchParams.get("index"),
         cellId: url.searchParams.get("cellId"),
         id: url.searchParams.get("id"),
         marker: url.searchParams.get("marker"),
         selection: url.searchParams.get("selection")
-      });
-      return okResponse("output", {
-        cell: serializeCell(target.cell, target.index, {
-          includeSource: false,
-          includeMetadata: false,
-          includeOutputs: true,
-          outputTextLimit: 4000
-        }),
-        summary: `Collected outputs for cell ${target.index}`
       });
     }
     case "/execution/state":
@@ -1198,6 +2241,10 @@ async function httpPost(url, body) {
     case "/cell/clearOutputs":
     case "/output/clear":
       return clearOutputs(body);
+    case "/workflow/updateAndRun":
+      return workflowUpdateAndRun(body);
+    case "/workflow/insertAndRun":
+      return workflowInsertAndRun(body);
     case "/run/current":
       return runNotebookCommandWithLocator("run.current", "notebook.cell.execute", body, { useCurrentSelection: true });
     case "/run/cell":
@@ -1208,7 +2255,14 @@ async function httpPost(url, body) {
       return runNotebookCommandWithLocator("run.below", "notebook.cell.executeCellAndBelow", body);
     case "/run/all":
       await executeCommand("notebook.execute", [], { kind: "execution", target: { scope: "all" } });
-      return okResponse("run.all", { accepted: true, pendingObservation: true, summary: "Execution requested for entire notebook" });
+      return okResponse("run.all", {
+        accepted: true,
+        pendingObservation: true,
+        completionObserved: false,
+        outputObserved: false,
+        identityStable: true,
+        summary: "Execution requested for entire notebook"
+      });
     case "/run/selectedAndAdvance":
       return runNotebookCommandWithLocator("run.selectedAndAdvance", "notebook.cell.executeAndSelectBelow", body, {
         useCurrentSelection: toBoolean(body.useCurrentSelection, false)
@@ -1268,6 +2322,7 @@ async function httpPost(url, body) {
 
 async function startServer() {
   if (bridgeServer) {
+    refreshControlCenterSoon(0);
     return;
   }
   const config = getServerConfig();
@@ -1309,19 +2364,52 @@ async function startServer() {
     }
   });
 
-  await new Promise((resolve, reject) => {
-    bridgeServer.once("error", reject);
-    bridgeServer.listen(config.port, config.host, () => {
-      bridgeServer.off("error", reject);
-      resolve();
-    });
-  });
+  const candidatePorts = Array.from({ length: Math.max(config.portSpan || 1, 1) }, (_, index) => config.port + index);
+  let boundPort = null;
+  let lastError = null;
 
-  log(`Server started at http://${config.host}:${config.port}`);
+  for (const port of candidatePorts) {
+    try {
+      await new Promise((resolve, reject) => {
+        const onError = (error) => {
+          bridgeServer.off("error", onError);
+          reject(error);
+        };
+        bridgeServer.once("error", onError);
+        bridgeServer.listen(port, config.host, () => {
+          bridgeServer.off("error", onError);
+          resolve();
+        });
+      });
+      boundPort = port;
+      break;
+    } catch (error) {
+      lastError = error;
+      if (error.code !== "EADDRINUSE") {
+        throw error;
+      }
+    }
+  }
+
+  if (boundPort === null) {
+    throw lastError || new Error("Unable to bind any bridge port");
+  }
+
+  bridgeState.server = {
+    host: config.host,
+    port: boundPort,
+    basePort: config.port,
+    portSpan: config.portSpan,
+    startedAt: new Date().toISOString()
+  };
+
+  log(`Server started at http://${config.host}:${boundPort} for ${JSON.stringify(windowIdentity())}`);
+  refreshControlCenterSoon(0);
 }
 
 async function stopServer() {
   if (!bridgeServer) {
+    refreshControlCenterSoon(0);
     return;
   }
   const server = bridgeServer;
@@ -1335,27 +2423,39 @@ async function stopServer() {
       resolve();
     });
   });
+  bridgeState.server = {
+    host: null,
+    port: null,
+    basePort: null,
+    portSpan: null,
+    startedAt: null
+  };
   log("Server stopped");
+  refreshControlCenterSoon(0);
 }
 
 function showStatus() {
-  const config = getServerConfig();
+  const host = bridgeState.server.host || getServerConfig().host;
+  const port = bridgeState.server.port || getServerConfig().port;
   const notebook = activeNotebookInfo();
   const serverRunning = Boolean(bridgeServer);
   vscode.window.showInformationMessage(
-    `Data Bridge ${serverRunning ? "running" : "stopped"} on http://${config.host}:${config.port} | Active notebook: ${notebook.hasActiveNotebook ? "yes" : "no"}`
+    `Data Bridge ${serverRunning ? (localeBundle() === I18N.zh ? "运行中" : "running") : (localeBundle() === I18N.zh ? "已停止" : "stopped")} on http://${host}:${port} | ${localeBundle() === I18N.zh ? "活动笔记本" : "Active notebook"}: ${notebook.hasActiveNotebook ? t("yes") : t("no")}`
   );
   output.show(true);
 }
 
 async function copyServerConfig() {
-  const config = getServerConfig();
+  const host = bridgeState.server.host || getServerConfig().host;
+  const port = bridgeState.server.port || getServerConfig().port;
   await vscode.env.clipboard.writeText(JSON.stringify({
-    baseUrl: `http://${config.host}:${config.port}`,
-    token: config.token || null,
-    endpoints: DEFAULT_ENDPOINTS
+    baseUrl: `http://${host}:${port}`,
+    token: getServerConfig().token || null,
+    endpoints: DEFAULT_ENDPOINTS,
+    window: windowIdentity()
   }, null, 2));
-  vscode.window.showInformationMessage("Data Bridge config copied to clipboard.");
+  vscode.window.showInformationMessage(localeBundle() === I18N.zh ? "Data Bridge 配置已复制到剪贴板。" : "Data Bridge config copied to clipboard.");
+  refreshControlCenterSoon(0);
 }
 
 async function runNotebookCommand() {

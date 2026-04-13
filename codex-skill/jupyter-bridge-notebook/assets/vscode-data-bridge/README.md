@@ -3,6 +3,7 @@
 Local VS Code extension that exposes notebook and data-analysis commands through:
 
 - the Command Palette
+- a dedicated Data Bridge control center sidebar
 - a local HTTP bridge on a configurable host and port
 
 Defaults:
@@ -39,6 +40,25 @@ The bridge also tracks notebook runtime signals from VS Code notebook events so 
 
 These signals are surfaced through `GET /status`, `GET /context`, `GET /execution/state`, and `GET /kernel/state`.
 
+Bridge-first compliance is surfaced through `GET /compliance`, and common mutation-plus-execution flows are available as:
+
+- `POST /workflow/updateAndRun`
+- `POST /workflow/insertAndRun`
+
+## Control Center Sidebar
+
+The extension contributes a `Data Bridge` sidebar with a `Control Center` view. It shows:
+
+- the current focused notebook
+- the bound bridge server and base URL
+- the local bridge server list across the configured port span
+- kernel busy/idle and bridge compliance state
+- editable settings for auto-start, scroll follow, host, port, port span, token, and command safety
+- Chinese UI labels when VS Code is running in Chinese
+- lightweight auto-refresh only while the control center is visible
+
+If you prefer the secondary sidebar on the right, move the `Data Bridge` view container there in VS Code after reload.
+
 ## Install For Development
 
 1. Open this folder as a VS Code extension project.
@@ -50,6 +70,10 @@ These signals are surfaced through `GET /status`, `GET /context`, `GET /executio
 ### `GET /status`
 
 Returns bridge status and active notebook metadata.
+
+### `GET /servers`
+
+Returns the local bridge server list discovered across the configured host and port span.
 
 ### `GET /commands`
 
@@ -66,16 +90,10 @@ Example body:
 }
 ```
 
-PowerShell example:
+Recommended local client:
 
-```powershell
-$baseUrl = if ($env:DATA_BRIDGE_BASE_URL) { $env:DATA_BRIDGE_BASE_URL } else { 'http://127.0.0.1:8765' }
-Invoke-RestMethod -Method Post -Uri "$baseUrl/execute" -ContentType 'application/json' -Body '{"command":"jupyter.runcell","args":[]}'
+```cmd
+bridgectl.exe -method POST -path /execute -body "{\"command\":\"jupyter.runcell\",\"args\":[]}"
 ```
 
-If `dataBridge.token` is set, send:
-
-```powershell
-$baseUrl = if ($env:DATA_BRIDGE_BASE_URL) { $env:DATA_BRIDGE_BASE_URL } else { 'http://127.0.0.1:8765' }
-Invoke-RestMethod -Method Post -Uri "$baseUrl/execute" -Headers @{ Authorization = 'Bearer YOUR_TOKEN' } -ContentType 'application/json' -Body '{"command":"jupyter.runcell","args":[]}'
-```
+If `dataBridge.token` is set, pass `-token YOUR_TOKEN` to `bridgectl.exe`.

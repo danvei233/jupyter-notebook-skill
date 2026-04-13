@@ -14,16 +14,17 @@ Read this file when:
 ## Standard Install Flow
 
 1. Detect whether the extension is installed:
-   - run `scripts/check_bridge_extension.ps1`
+   - run `scripts/bridgectl.exe -check-extension -extension-id local.vscode-data-bridge`
 2. If it is already installed:
    - keep using the existing bridge
 3. If it is missing:
    - ask the user for approval to install the extension
 4. After approval:
-   - run `scripts/install_bridge_extension.ps1`
+   - run `scripts/bridgectl.exe -install-extension ..\\assets\\vscode-data-bridge\\vscode-data-bridge-0.0.1.vsix`
 5. After install:
    - ask the user to run `Developer: Reload Window`
    - then verify with `GET /status`
+   - then verify with `GET /compliance`
 
 ## Bundled Migration Assets
 
@@ -34,10 +35,12 @@ The skill includes a portable copy of the bridge extension under `assets/vscode-
 - `package.json`
 - `README.md`
 
+The skill includes `scripts/bridgectl.exe` as the preferred local bridge client and extension installer.
+
 Use these bundled files as the preferred migration source instead of relying on an external path.
 
-The install scripts auto-detect `code-insiders` or `code` from PATH and can also use `VSCODE_CLI` or `CODE_CLI`.
+`bridgectl.exe` auto-detects `code-insiders` or `code` from PATH and can also use `VSCODE_CLI` or `CODE_CLI`.
 
 ## Consent Rule
 
-Do not install the extension silently. Ask the user first. Once the user agrees, run the install script automatically.
+Do not install the extension silently. Ask the user first. Once the user agrees, run the bundled `bridgectl.exe` install command automatically.

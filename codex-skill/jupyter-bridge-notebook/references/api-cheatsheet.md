@@ -3,6 +3,8 @@
 ## Read
 
 - `GET /status`
+- `GET /servers`
+- `GET /compliance`
 - `GET /notebook`
 - `GET /cells`
 - `GET /cell`
@@ -24,6 +26,8 @@
 - `POST /cell/reveal`
 - `POST /cell/replaceOutputs`
 - `POST /cell/clearOutputs`
+- `POST /workflow/updateAndRun`
+- `POST /workflow/insertAndRun`
 
 ## Run
 

@@ -5,109 +5,113 @@ description: Operate and structure Jupyter notebooks (.ipynb) in VS Code through
 
 # Jupyter Bridge Notebook
 
-Use the local VS Code Data Bridge as the default control plane for notebook work. Read notebook identity and state before mutating or running anything. Structure notebooks into task-sized cells with appropriate markdown headings when the task calls for explanation, reporting, teaching, debugging, or staged analysis.
+Use the local VS Code Data Bridge as the default control plane for notebook work.
 
-## Install and Availability
+## Core Contract
 
-If bridge calls fail, if `/status` is unavailable, or if notebook bridge features appear missing:
+- When the bridge is available, notebook mutation and execution must go through the bridge.
+- Do not silently fall back to `.py` generators, `nbclient`, `nbconvert`, or direct `.ipynb` rewriting.
+- Do not claim a cell ran or produced outputs unless bridge-backed execution or direct bridge output reads confirm it.
+- PowerShell is forbidden for this skill. Use `scripts/bridgectl.exe`.
+- If temporary JSON request bodies are needed for `bridgectl -body-file`, store them under `./tmp/bridgebody/` in the current working directory, not in the project root.
+- For multi-line source, long markdown, or larger JSON payloads, default to `bridgectl -body-file` instead of inline `-body`.
 
-1. Read [install.md](install.md).
-2. Check whether the bridge extension is installed before attempting notebook work.
-3. If it is missing, ask the user for approval to install it.
-4. After approval, run the install script instead of manually reproducing the install steps.
+## Workflow Modes
 
-Treat installation and migration assets in this skill folder as the source of truth for bridge setup.
+Default mode: `streaming-analysis`.
 
-## Target Notebook First
+### `streaming-analysis`
+
+Use this unless the user explicitly asks for something looser.
+
+- Write a small stage.
+- Run that stage.
+- Inspect outputs/state.
+- Adjust code or continue.
+- Generate conclusions from observed results, not from assumptions.
+- Do not default to writing the full notebook and then finishing with `/run/all`.
+
+### `blank`
+
+Use this only when the user explicitly wants no imposed notebook workflow.
+
+- Keep bridge-first mutation/execution rules.
+- Otherwise allow normal Codex judgment about structure and execution order.
+
+Read [references/workflow-modes.md](references/workflow-modes.md) for the full mode rules.
+
+## First Moves
 
 Before any write, run, or debug action:
 
-1. Read `GET /status` or `GET /context`.
-2. Confirm the active notebook `uri`, selection, and cell count.
-3. If the user refers to a specific notebook and the active notebook does not match, stop and reconcile the target notebook first.
-4. If there is no active notebook, recover focus before doing anything else.
+1. `GET /status`
+2. `GET /compliance`
+3. `GET /context` or `GET /cell`
 
-Read [references/notebook-identity.md](references/notebook-identity.md) when:
+Confirm:
 
-- the user may have multiple notebooks open
-- the notebook was closed, reloaded, or switched
-- you need rules for choosing between notebook `uri`, title, and current selection
+- active notebook `uri`
+- `identity.versionToken`
+- selection
+- cell count
 
-## State Before Action
+Use `GET /servers` when multiple windows or bridge servers may be involved.
 
-Treat notebook and kernel state as part of the task. Read state before assuming a cell can be executed safely.
+## Structure Rules
 
-- Use `GET /status` for a quick check.
-- Use `GET /context` when you need full notebook context.
-- Use `GET /execution/state`, `GET /debug/state`, `GET /kernel/state`, and `GET /output` for targeted inspection.
-- Treat `unknownBusyState: true` as "state not fully observable"; avoid risky bulk execution when the state is uncertain.
+- Split notebooks by task boundary, debug boundary, rerun cost, and execution checkpoint.
+- Avoid one huge code cell.
+- Add markdown headings when the notebook is meant to explain, report, teach, or present.
+- Keep markdown lighter when the user wants a minimal runnable notebook.
+- Prefer stage-by-stage validation over full-notebook first-pass execution.
 
-Read [references/state-model.md](references/state-model.md) when you need rules for:
+Read [references/structure-rules.md](references/structure-rules.md) when you need detailed layout rules or templates.
 
-- running vs idle vs unknown state
-- uninitialized or unavailable notebook state
-- likely user interruption or reload scenarios
-- deciding whether to run, restart, debug, or recover first
+## Plotting Rule
 
-## Notebook Structuring Rules
+When using `matplotlib` / `plt`, apply the default style contract unless the user overrides it:
 
-Notebook layout is a first-class skill, not an afterthought.
+- English: `Times New Roman`
+- Chinese: `SimSun` / 宋体
+- UTF-8-safe Chinese support enabled
+- axes spines width `1.5`
+- titles, axis titles, and tick labels bold
 
-- Split by task boundary: imports, config, data loading, preprocessing, feature work, visualization, export, and conclusions should usually be separate cells.
-- Split by debug boundary: network calls, database access, file IO, long-running computation, and plotting should be isolated into their own cells.
-- Split by rerun cost: frequently rerun steps should not be bundled with heavy initialization or unrelated output.
-- Add markdown headings when the user wants a report, tutorial, experiment log, presentation, or a more readable notebook.
-- Reduce markdown when the user explicitly wants a minimal execution notebook.
-- Avoid "one huge code cell". If one cell reads data, transforms it, analyzes it, plots it, and exports it, split it by default.
-- Preserve linear execution context. When splitting cells, keep dependency order natural and avoid scattering shared state unnecessarily.
+Read [references/plotting-style.md](references/plotting-style.md) for the reusable setup cell.
 
-Choose a layout template from [references/structure-rules.md](references/structure-rules.md):
+## High-Value Paths
 
-- data-analysis
-- experiment/tuning
-- debugging
-- delivery/presentation
+- Read state: `GET /status`, `GET /compliance`, `GET /context`, `GET /output`
+- Discover windows/servers: `GET /servers`
+- Edit cells: `/cell/insert`, `/cell/append`, `/cell/update`, `/cell/move`, `/cell/delete`
+- Atomic workflows: `/workflow/updateAndRun`, `/workflow/insertAndRun`
+- Run targeted cells: `/run/current`, `/run/cell`, `/run/above`, `/run/below`
+- Debug: `/debug/cell`, `/debug/continue`, `/debug/stepOver`, `/debug/stop`
+- Viewers: `/viewer/variables/open`, `/viewer/data/open`, `/viewer/output/open`
+- UI: open the `Data Bridge` control center when interactive status/config is useful
 
-Default to the lightweight data-analysis template when the task type is unclear.
+Read [references/common-recipes.md](references/common-recipes.md) for task recipes.
 
-## Common Task Recipes
+## Recovery
 
-Use the bridge for notebook operations instead of directly editing `.ipynb` files whenever possible.
+- If locator lookup fails, strengthen the locator: `index` > `selection=current` > precise marker.
+- If marker matches multiple cells, do not guess.
+- If state is stale, re-read `/status` or `/context`.
+- If bridge mutation or execution fails, diagnose bridge first. Do not switch paths silently.
+- `kernel/shutdown` is currently unsupported.
 
-- Read notebook or cells: `GET /notebook`, `GET /cells`, `GET /cell`, `GET /context`
-- Edit structure: `/cell/insert`, `/cell/append`, `/cell/update`, `/cell/move`, `/cell/delete`, `/cell/duplicate`
-- Manage notebook selection: `/cell/select`, `/cell/reveal`
-- Run cells: `/run/current`, `/run/cell`, `/run/above`, `/run/below`, `/run/all`, `/run/selectedAndAdvance`
-- Manage outputs: `GET /output`, `/cell/replaceOutputs`, `/cell/clearOutputs`, `/output/clear`
-- Debug cells: `/debug/cell`, `/debug/continue`, `/debug/stepOver`, `/debug/stop`
-- Kernel and viewers: `/kernel/interrupt`, `/kernel/restart`, `/kernel/restartAndRunAll`, `/kernel/select`, `/viewer/variables/open`, `/viewer/data/open`, `/viewer/output/open`
+Read:
 
-Read [references/common-recipes.md](references/common-recipes.md) for task-oriented workflows.
+- [references/notebook-identity.md](references/notebook-identity.md)
+- [references/state-model.md](references/state-model.md)
+- [references/debug-and-recovery.md](references/debug-and-recovery.md)
+- [references/api-cheatsheet.md](references/api-cheatsheet.md)
+- [references/limitations.md](references/limitations.md)
 
-## Recovery Rules
+## Install
 
-- If target cell lookup fails, retry with a stronger locator: prefer `index`, then `selection=current`, then a precise marker.
-- If a marker matches multiple cells, do not guess.
-- If notebook state is missing or stale, re-read `/status` or `/context`.
-- If execution or debug state looks wrong after a reload, re-verify active notebook identity before acting.
-- If `kernel/shutdown` is requested, note that it is currently unsupported and choose an available recovery path instead.
+If bridge features are missing:
 
-Read [references/debug-and-recovery.md](references/debug-and-recovery.md) for recovery and debug flows.
-Read [references/limitations.md](references/limitations.md) before relying on edge behaviors.
-
-## Reference Map
-
-- Notebook targeting: [references/notebook-identity.md](references/notebook-identity.md)
-- State model: [references/state-model.md](references/state-model.md)
-- Common task recipes: [references/common-recipes.md](references/common-recipes.md)
-- Notebook structuring: [references/structure-rules.md](references/structure-rules.md)
-- Debug and recovery: [references/debug-and-recovery.md](references/debug-and-recovery.md)
-- API quick lookup: [references/api-cheatsheet.md](references/api-cheatsheet.md)
-- Known limitations: [references/limitations.md](references/limitations.md)
-
-## Scripts
-
-- Use [scripts/bridge_call.ps1](scripts/bridge_call.ps1) as the default wrapper for local bridge calls.
-- Use [scripts/invoke-data-bridge.ps1](scripts/invoke-data-bridge.ps1) when you need a portable, skill-local bridge helper.
-- Use [scripts/check_bridge_extension.ps1](scripts/check_bridge_extension.ps1) to detect whether the bridge extension is installed.
-- Use [scripts/install_bridge_extension.ps1](scripts/install_bridge_extension.ps1) after user approval to install or reinstall the bridge extension from the bundled VSIX.
+1. Read [install.md](install.md)
+2. Check with `scripts/bridgectl.exe -check-extension -extension-id local.vscode-data-bridge`
+3. After user approval, install with `scripts/bridgectl.exe -install-extension ..\\assets\\vscode-data-bridge\\vscode-data-bridge-0.0.1.vsix`
