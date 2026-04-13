@@ -3,7 +3,16 @@
 Local VS Code extension that exposes notebook and data-analysis commands through:
 
 - the Command Palette
-- a local HTTP bridge on `127.0.0.1:8765` by default
+- a local HTTP bridge on a configurable host and port
+
+Defaults:
+
+- host: `127.0.0.1`
+- port: `8765`
+- override via extension settings or environment variables:
+  - `DATA_BRIDGE_HOST` / `VSCODE_DATA_BRIDGE_HOST`
+  - `DATA_BRIDGE_PORT` / `VSCODE_DATA_BRIDGE_PORT`
+  - `DATA_BRIDGE_TOKEN` / `VSCODE_DATA_BRIDGE_TOKEN`
 
 ## What It Can Trigger
 
@@ -17,6 +26,18 @@ Local VS Code extension that exposes notebook and data-analysis commands through
 - `notebook.selectKernel`
 
 It can also execute other `jupyter.*`, `notebook.*`, `interactive.*`, and `workbench.action.notebook.*` commands by default.
+
+## Observability
+
+The bridge also tracks notebook runtime signals from VS Code notebook events so agents can act on real editor state instead of assuming it:
+
+- active notebook identity and switch events
+- execution requests and pending execution targets
+- output change notifications
+- execution summary changes
+- inferred busy/idle transitions for the active notebook
+
+These signals are surfaced through `GET /status`, `GET /context`, `GET /execution/state`, and `GET /kernel/state`.
 
 ## Install For Development
 
@@ -48,11 +69,13 @@ Example body:
 PowerShell example:
 
 ```powershell
-Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8765/execute -ContentType 'application/json' -Body '{"command":"jupyter.runcell","args":[]}'
+$baseUrl = if ($env:DATA_BRIDGE_BASE_URL) { $env:DATA_BRIDGE_BASE_URL } else { 'http://127.0.0.1:8765' }
+Invoke-RestMethod -Method Post -Uri "$baseUrl/execute" -ContentType 'application/json' -Body '{"command":"jupyter.runcell","args":[]}'
 ```
 
 If `dataBridge.token` is set, send:
 
 ```powershell
-Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8765/execute -Headers @{ Authorization = 'Bearer YOUR_TOKEN' } -ContentType 'application/json' -Body '{"command":"jupyter.runcell","args":[]}'
+$baseUrl = if ($env:DATA_BRIDGE_BASE_URL) { $env:DATA_BRIDGE_BASE_URL } else { 'http://127.0.0.1:8765' }
+Invoke-RestMethod -Method Post -Uri "$baseUrl/execute" -Headers @{ Authorization = 'Bearer YOUR_TOKEN' } -ContentType 'application/json' -Body '{"command":"jupyter.runcell","args":[]}'
 ```

@@ -92,7 +92,14 @@ const bridgeState = {
   lastKernelAction: null,
   lastNotebookAction: null,
   lastMutation: null,
-  lastError: null
+  lastError: null,
+  notebookRuntime: {},
+  activeNotebook: {
+    uri: null,
+    switchedAt: null,
+    switchCount: 0,
+    visibleEditors: 0
+  }
 };
 
 let bridgeServer;
@@ -101,6 +108,21 @@ let output;
 function activate(context) {
   output = vscode.window.createOutputChannel("Data Bridge");
   context.subscriptions.push(output);
+
+  context.subscriptions.push(
+    vscode.window.onDidChangeActiveNotebookEditor((editor) => {
+      updateActiveNotebookIdentity(editor, "active-editor-changed");
+    }),
+    vscode.window.onDidChangeVisibleNotebookEditors((editors) => {
+      bridgeState.activeNotebook.visibleEditors = editors.length;
+    }),
+    vscode.workspace.onDidChangeNotebookDocument((event) => {
+      updateNotebookRuntimeFromEvent(event);
+    })
+  );
+
+  updateActiveNotebookIdentity(vscode.window.activeNotebookEditor || null, "activate");
+  bridgeState.activeNotebook.visibleEditors = vscode.window.visibleNotebookEditors.length;
 
   context.subscriptions.push(
     vscode.commands.registerCommand("dataBridge.startServer", async () => startServer()),
@@ -127,10 +149,13 @@ function getConfig() {
 
 function getServerConfig() {
   const config = getConfig();
+  const envHost = process.env.DATA_BRIDGE_HOST || process.env.VSCODE_DATA_BRIDGE_HOST;
+  const envPort = process.env.DATA_BRIDGE_PORT || process.env.VSCODE_DATA_BRIDGE_PORT;
+  const envToken = process.env.DATA_BRIDGE_TOKEN || process.env.VSCODE_DATA_BRIDGE_TOKEN;
   return {
-    host: config.get("host", "127.0.0.1"),
-    port: config.get("port", 8765),
-    token: config.get("token", ""),
+    host: envHost || config.get("host", "127.0.0.1"),
+    port: toInteger(envPort, config.get("port", 8765)),
+    token: envToken !== undefined ? envToken : config.get("token", ""),
     allowArbitraryCommands: config.get("allowArbitraryCommands", false),
     allowedPrefixes: config.get("allowedCommandPrefixes", [])
   };
@@ -248,6 +273,105 @@ function cellId(cell) {
   return cell.document.uri.toString();
 }
 
+function notebookUri(editorOrNotebook) {
+  if (!editorOrNotebook) {
+    return null;
+  }
+  const notebook = editorOrNotebook.notebook || editorOrNotebook;
+  return notebook && notebook.uri ? notebook.uri.toString() : null;
+}
+
+function notebookRuntimeRecord(uri) {
+  if (!uri) {
+    return null;
+  }
+  if (!bridgeState.notebookRuntime[uri]) {
+    bridgeState.notebookRuntime[uri] = {
+      uri,
+      busy: false,
+      statusKnown: false,
+      executionRequestedAt: null,
+      lastExecutionCompletedAt: null,
+      lastOutputChangeAt: null,
+      lastDocumentChangeAt: null,
+      lastSelectionSeenAt: null,
+      lastActivatedAt: null,
+      lastIdentityReason: null,
+      executionChangeCount: 0,
+      outputChangeCount: 0,
+      pendingTargets: [],
+      lastObservedExecutionOrder: null,
+      lastObservedCellIds: [],
+      lastObservedNotebookVersion: 0
+    };
+  }
+  return bridgeState.notebookRuntime[uri];
+}
+
+function activeRuntime(editor = activeNotebookEditor()) {
+  const uri = notebookUri(editor);
+  return notebookRuntimeRecord(uri);
+}
+
+function updateActiveNotebookIdentity(editor, reason) {
+  const uri = notebookUri(editor);
+  bridgeState.activeNotebook.uri = uri;
+  bridgeState.activeNotebook.switchedAt = new Date().toISOString();
+  bridgeState.activeNotebook.switchCount += 1;
+  const runtime = notebookRuntimeRecord(uri);
+  if (runtime) {
+    runtime.lastActivatedAt = bridgeState.activeNotebook.switchedAt;
+    runtime.lastIdentityReason = reason;
+    runtime.lastSelectionSeenAt = editor && editor.selections ? new Date().toISOString() : runtime.lastSelectionSeenAt;
+  }
+}
+
+function updateNotebookRuntimeFromEvent(event) {
+  const uri = notebookUri(event.notebook);
+  const runtime = notebookRuntimeRecord(uri);
+  if (!runtime) {
+    return;
+  }
+  const changedAt = new Date().toISOString();
+  runtime.statusKnown = true;
+  runtime.lastDocumentChangeAt = changedAt;
+  runtime.lastObservedNotebookVersion += 1;
+  const outputChanged = event.cellChanges.some((change) => Array.isArray(change.outputs) && change.outputs.length >= 0);
+  const executionChanged = event.cellChanges.some((change) => change.executionSummary !== undefined);
+
+  if (outputChanged) {
+    runtime.outputChangeCount += 1;
+    runtime.lastOutputChangeAt = changedAt;
+  }
+
+  if (executionChanged) {
+    runtime.executionChangeCount += 1;
+    runtime.lastExecutionCompletedAt = changedAt;
+    runtime.busy = false;
+    runtime.pendingTargets = [];
+    if (bridgeState.lastExecution && bridgeState.lastExecution.notebookUri === uri) {
+      bridgeState.lastExecution.pendingObservation = false;
+      bridgeState.lastExecution.completedAt = changedAt;
+    }
+  } else if (outputChanged && runtime.pendingTargets.length > 0) {
+    runtime.busy = true;
+  }
+
+  const observedCells = event.cellChanges
+    .filter((change) => change.cell)
+    .map((change) => cellId(change.cell));
+  if (observedCells.length > 0) {
+    runtime.lastObservedCellIds = observedCells;
+  }
+
+  const observedExecutionOrder = event.cellChanges
+    .map((change) => change.executionSummary && change.executionSummary.executionOrder)
+    .find((value) => typeof value === "number");
+  if (typeof observedExecutionOrder === "number") {
+    runtime.lastObservedExecutionOrder = observedExecutionOrder;
+  }
+}
+
 function serializeCell(cell, index, options = {}) {
   const source = cell.document.getText();
   return {
@@ -270,6 +394,7 @@ function activeNotebookEditor() {
 }
 
 function activeNotebookInfo(editor = activeNotebookEditor()) {
+  const runtime = activeRuntime(editor);
   return {
     hasActiveNotebook: Boolean(editor),
     uri: editor ? editor.notebook.uri.toString() : null,
@@ -277,17 +402,30 @@ function activeNotebookInfo(editor = activeNotebookEditor()) {
     isDirty: editor ? Boolean(editor.notebook.isDirty) : false,
     cellCount: editor ? editor.notebook.cellCount : 0,
     visibleRange: editor ? editor.visibleRanges.map((range) => serializeRange(range)) : [],
-    selection: editor ? editor.selections.map((range) => serializeRange(range)) : []
+    selection: editor ? editor.selections.map((range) => serializeRange(range)) : [],
+    identity: {
+      activeUri: bridgeState.activeNotebook.uri,
+      switchedAt: bridgeState.activeNotebook.switchedAt,
+      switchCount: bridgeState.activeNotebook.switchCount,
+      visibleEditors: bridgeState.activeNotebook.visibleEditors,
+      lastActivatedAt: runtime ? runtime.lastActivatedAt : null,
+      lastIdentityReason: runtime ? runtime.lastIdentityReason : null
+    }
   };
 }
 
 function kernelState(editor = activeNotebookEditor()) {
+  const runtime = activeRuntime(editor);
   return {
     supported: Boolean(editor),
     connected: Boolean(editor),
-    busy: false,
-    unknownBusyState: true,
+    busy: Boolean(runtime && runtime.busy),
+    unknownBusyState: Boolean(!runtime || !runtime.statusKnown),
     supportsShutdown: false,
+    executionRequestedAt: runtime ? runtime.executionRequestedAt : null,
+    lastExecutionCompletedAt: runtime ? runtime.lastExecutionCompletedAt : null,
+    lastOutputChangeAt: runtime ? runtime.lastOutputChangeAt : null,
+    pendingTargets: runtime ? runtime.pendingTargets : [],
     lastKernelAction: bridgeState.lastKernelAction,
     lastExecution: bridgeState.lastExecution
   };
@@ -309,11 +447,21 @@ function debugState(editor = activeNotebookEditor()) {
 }
 
 function executionState(editor = activeNotebookEditor()) {
+  const runtime = activeRuntime(editor);
   return {
     notebook: activeNotebookInfo(editor),
     kernel: kernelState(editor),
     lastExecution: bridgeState.lastExecution,
-    pendingObservation: Boolean(bridgeState.lastExecution && bridgeState.lastExecution.pendingObservation)
+    pendingObservation: Boolean(bridgeState.lastExecution && bridgeState.lastExecution.pendingObservation),
+    observed: runtime
+      ? {
+          executionChangeCount: runtime.executionChangeCount,
+          outputChangeCount: runtime.outputChangeCount,
+          lastDocumentChangeAt: runtime.lastDocumentChangeAt,
+          lastObservedExecutionOrder: runtime.lastObservedExecutionOrder,
+          lastObservedCellIds: runtime.lastObservedCellIds
+        }
+      : null
   };
 }
 
@@ -568,28 +716,47 @@ function buildOutputs(outputs = []) {
 
 async function executeCommand(commandId, args = [], meta = {}) {
   log(`Executing command: ${commandId}`);
+  const currentEditor = activeNotebookEditor();
+  const currentUri = notebookUri(currentEditor);
+  const runtime = notebookRuntimeRecord(currentUri);
   const result = await vscode.commands.executeCommand(commandId, ...args);
   if (meta.kind === "execution") {
     bridgeState.lastExecution = {
       command: commandId,
       at: new Date().toISOString(),
       target: meta.target || null,
-      pendingObservation: true
+      pendingObservation: true,
+      notebookUri: currentUri
     };
+    if (runtime) {
+      runtime.statusKnown = true;
+      runtime.busy = true;
+      runtime.executionRequestedAt = bridgeState.lastExecution.at;
+      runtime.pendingTargets = meta.target ? [meta.target] : [];
+    }
   }
   if (meta.kind === "debug") {
     bridgeState.lastDebug = {
       command: commandId,
       at: new Date().toISOString(),
-      target: meta.target || null
+      target: meta.target || null,
+      notebookUri: currentUri
     };
   }
   if (meta.kind === "kernel") {
     bridgeState.lastKernelAction = {
       command: commandId,
       at: new Date().toISOString(),
-      target: meta.target || null
+      target: meta.target || null,
+      notebookUri: currentUri
     };
+    if (runtime) {
+      runtime.statusKnown = true;
+      if (commandId === "jupyter.interruptkernel" || commandId === "jupyter.restartkernel") {
+        runtime.busy = false;
+        runtime.pendingTargets = [];
+      }
+    }
   }
   if (meta.kind === "notebook") {
     bridgeState.lastNotebookAction = {
@@ -903,7 +1070,9 @@ async function httpGet(url) {
           allowArbitraryCommands: getServerConfig().allowArbitraryCommands
         },
         commands: QUICK_COMMANDS,
-        capabilities: capabilities()
+        capabilities: capabilities(),
+        execution: executionState(editor),
+        debug: debugState(editor)
       });
     case "/commands": {
       const includeAll = url.searchParams.get("all") === "1";

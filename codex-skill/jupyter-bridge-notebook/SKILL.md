@@ -107,6 +107,7 @@ Read [references/limitations.md](references/limitations.md) before relying on ed
 
 ## Scripts
 
-- Use [scripts/bridge_call.ps1](scripts/bridge_call.ps1) as a thin wrapper around `D:\sky\invoke-data-bridge.ps1` for local bridge calls.
+- Use [scripts/bridge_call.ps1](scripts/bridge_call.ps1) as the default wrapper for local bridge calls.
+- Use [scripts/invoke-data-bridge.ps1](scripts/invoke-data-bridge.ps1) when you need a portable, skill-local bridge helper.
 - Use [scripts/check_bridge_extension.ps1](scripts/check_bridge_extension.ps1) to detect whether the bridge extension is installed.
 - Use [scripts/install_bridge_extension.ps1](scripts/install_bridge_extension.ps1) after user approval to install or reinstall the bridge extension from the bundled VSIX.

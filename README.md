@@ -12,6 +12,7 @@ This project bundles:
 ## What It Does
 
 - Read notebook state, context, cells, outputs, and execution metadata
+- Observe active notebook switches, execution completion, output changes, and inferred busy/idle state
 - Insert, update, move, duplicate, delete, and select notebook cells
 - Run current, targeted, ranged, or full-notebook execution flows
 - Open Variables, Data Viewer, and Jupyter output panels
@@ -47,7 +48,12 @@ jupyter-bridge-notebook-project/
 Install the bundled VSIX:
 
 ```powershell
-& "C:\Users\丁薇\AppData\Local\Programs\Microsoft VS Code Insiders\bin\code-insiders.cmd" --install-extension ".\bridge-extension\vscode-data-bridge-0.0.1.vsix" --force
+$codeCli = $env:VSCODE_CLI
+if (-not $codeCli) {
+  $candidates = "code-insiders","code"
+  $codeCli = ($candidates | ForEach-Object { Get-Command $_ -ErrorAction SilentlyContinue } | Select-Object -First 1 -ExpandProperty Source)
+}
+& $codeCli --install-extension ".\bridge-extension\vscode-data-bridge-0.0.1.vsix" --force
 ```
 
 Then reload VS Code:
@@ -63,6 +69,8 @@ Check bridge status:
 ```powershell
 .\invoke-data-bridge.ps1 -Method GET -Path /status
 ```
+
+If you need a non-default bridge host, set `DATA_BRIDGE_BASE_URL` or configure the extension host and port.
 
 Read full notebook context:
 

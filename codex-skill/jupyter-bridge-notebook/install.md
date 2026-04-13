@@ -36,6 +36,8 @@ The skill includes a portable copy of the bridge extension under `assets/vscode-
 
 Use these bundled files as the preferred migration source instead of relying on an external path.
 
+The install scripts auto-detect `code-insiders` or `code` from PATH and can also use `VSCODE_CLI` or `CODE_CLI`.
+
 ## Consent Rule
 
 Do not install the extension silently. Ask the user first. Once the user agrees, run the install script automatically.
