@@ -32,6 +32,7 @@ const QUICK_COMMANDS = [
 
 const DEFAULT_ENDPOINTS = [
   "GET /status",
+  "GET /status/brief",
   "GET /servers",
   "GET /commands",
   "GET /capabilities",
@@ -44,11 +45,13 @@ const DEFAULT_ENDPOINTS = [
   "GET /kernel",
   "GET /kernel/state",
   "GET /output",
+  "GET /output/summary",
   "GET /execution/state",
   "GET /debug/state",
   "POST /execute",
   "POST /executeCellByIndex",
   "POST /cell/read",
+  "POST /cell/batch",
   "POST /cell/insert",
   "POST /cell/append",
   "POST /cell/update",
@@ -123,6 +126,7 @@ const bridgeState = {
 let bridgeServer;
 let output;
 let controlCenterProvider;
+let followAnimationSequence = 0;
 
 function activate(context) {
   output = vscode.window.createOutputChannel("Data Bridge");
@@ -378,6 +382,59 @@ function configurationTarget() {
 
 function shouldFollowTargetCell(forceReveal = false) {
   return forceReveal || getConfig().get("followTargetCell", true);
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function easeOutCubic(t) {
+  return 1 - Math.pow(1 - t, 3);
+}
+
+function currentVisibleAnchor(editor) {
+  if (editor && Array.isArray(editor.visibleRanges) && editor.visibleRanges.length > 0) {
+    const first = editor.visibleRanges[0];
+    const last = editor.visibleRanges[editor.visibleRanges.length - 1];
+    return Math.round((first.start + last.end - 1) / 2);
+  }
+  if (editor && Array.isArray(editor.selections) && editor.selections.length > 0) {
+    return editor.selections[0].start;
+  }
+  return 0;
+}
+
+async function revealCellSmoothly(editor, index, options = {}) {
+  if (!editor) {
+    return;
+  }
+  const targetRange = new vscode.NotebookRange(index, index + 1);
+  const startIndex = currentVisibleAnchor(editor);
+  const distance = Math.abs(index - startIndex);
+  if (distance <= 2 || options.immediate) {
+    editor.revealRange(targetRange);
+    return;
+  }
+
+  const animationId = ++followAnimationSequence;
+  const steps = Math.min(7, Math.max(3, Math.ceil(distance / 6)));
+  const frameDelay = Math.min(36, Math.max(18, Math.round((options.durationMs || 180) / steps)));
+  let lastIndex = startIndex;
+
+  for (let step = 1; step <= steps; step += 1) {
+    if (animationId !== followAnimationSequence) {
+      return;
+    }
+    const progress = easeOutCubic(step / steps);
+    const nextIndex = Math.round(startIndex + (index - startIndex) * progress);
+    if (nextIndex !== lastIndex || step === steps) {
+      editor.revealRange(new vscode.NotebookRange(nextIndex, nextIndex + 1));
+      lastIndex = nextIndex;
+    }
+    if (step < steps) {
+      await sleep(frameDelay);
+    }
+  }
 }
 
 async function updateBridgeSetting(key, value) {
@@ -1267,6 +1324,27 @@ function complianceState(editor = activeNotebookEditor()) {
   };
 }
 
+function briefState(editor = activeNotebookEditor()) {
+  const notebook = activeNotebookInfo(editor);
+  const execution = executionState(editor);
+  const compliance = complianceState(editor);
+  const server = {
+    host: bridgeState.server.host || getServerConfig().host,
+    port: bridgeState.server.port || getServerConfig().port,
+    baseUrl: currentServerBaseUrl()
+  };
+  return {
+    hasActiveNotebook: notebook.hasActiveNotebook,
+    uri: notebook.uri,
+    selection: notebook.selection,
+    versionToken: notebook.identity.versionToken,
+    busy: execution.busy,
+    bridgeAvailable: compliance.bridgeAvailable,
+    identityStable: compliance.activeNotebookIdentityStable,
+    server
+  };
+}
+
 function capabilities() {
   return {
     endpoints: DEFAULT_ENDPOINTS,
@@ -1315,7 +1393,14 @@ function responseError(error, operation) {
   };
 }
 
-function okResponse(operation, payload = {}) {
+function okResponse(operation, payload = {}, options = {}) {
+  if (options.includeState === false) {
+    return {
+      ok: true,
+      operation,
+      ...payload
+    };
+  }
   return {
     ok: true,
     operation,
@@ -1526,7 +1611,7 @@ async function selectCell(editor, index, options = {}) {
   const range = new vscode.NotebookRange(index, index + 1);
   editor.selections = [range];
   if (options.reveal !== false && shouldFollowTargetCell(options.forceReveal)) {
-    editor.revealRange(range);
+    await revealCellSmoothly(editor, index, options);
   }
   return range;
 }
@@ -1576,6 +1661,18 @@ function buildOutputItems(items = []) {
 
 function buildOutputs(outputs = []) {
   return outputs.map((outputSpec) => new vscode.NotebookCellOutput(buildOutputItems(outputSpec.items || []), outputSpec.metadata || {}));
+}
+
+function cellOutputSummary(cell) {
+  return (cell.outputs || []).map((output) => summarizeOutput(output));
+}
+
+function cellHasErrorOutput(cell) {
+  return Boolean(
+    (cell.outputs || []).some((output) =>
+      output.items.some((item) => item.mime === "application/vnd.code.notebook.error" || item.mime === "application/vnd.code.notebook.stderr")
+    )
+  );
 }
 
 async function executeCommand(commandId, args = [], meta = {}) {
@@ -1709,7 +1806,7 @@ async function insertCell(payload, append = false) {
   };
   const updatedEditor = getEditorOrThrow();
   const insertedCell = updatedEditor.notebook.cellAt(index);
-  if (shouldFollowTargetCell(false)) {
+  if (!toBoolean(payload.noFollow, false) && shouldFollowTargetCell(false)) {
     await selectCell(updatedEditor, index, { reveal: true });
   }
   return okResponse(append ? "cell.append" : "cell.insert", {
@@ -1740,7 +1837,7 @@ async function updateCell(payload) {
     lastMutationObservedAt: new Date().toISOString()
   };
   const refreshedCell = getEditorOrThrow().notebook.cellAt(target.index);
-  if (shouldFollowTargetCell(false)) {
+  if (!toBoolean(payload.noFollow, false) && shouldFollowTargetCell(false)) {
     await selectCell(getEditorOrThrow(), target.index, { reveal: true });
   }
   return okResponse("cell.update", {
@@ -1817,7 +1914,7 @@ async function moveCell(payload) {
     lastMutationApplied: true,
     lastMutationObservedAt: new Date().toISOString()
   };
-  if (shouldFollowTargetCell(false)) {
+  if (!toBoolean(payload.noFollow, false) && shouldFollowTargetCell(false)) {
     await selectCell(getEditorOrThrow(), destinationIndex, { reveal: true });
   }
   return okResponse("cell.move", {
@@ -1844,7 +1941,7 @@ async function duplicateCell(payload) {
     lastMutationObservedAt: new Date().toISOString()
   };
   const inserted = getEditorOrThrow().notebook.cellAt(insertIndex);
-  if (shouldFollowTargetCell(false)) {
+  if (!toBoolean(payload.noFollow, false) && shouldFollowTargetCell(false)) {
     await selectCell(getEditorOrThrow(), insertIndex, { reveal: true });
   }
   return okResponse("cell.duplicate", {
@@ -1860,8 +1957,8 @@ async function selectTargetCell(payload, revealOnly = false) {
   if (!revealOnly) {
     editor.selections = [range];
   }
-  if (revealOnly || shouldFollowTargetCell(true)) {
-    editor.revealRange(range);
+  if (!toBoolean(payload.noFollow, false) && (revealOnly || shouldFollowTargetCell(true))) {
+    await revealCellSmoothly(editor, target.index, { forceReveal: true });
   }
   return okResponse(revealOnly ? "cell.reveal" : "cell.select", {
     cell: serializeCell(target.cell, target.index),
@@ -1886,7 +1983,7 @@ async function replaceOutputs(payload) {
     lastMutationObservedAt: new Date().toISOString()
   };
   const refreshedCell = getEditorOrThrow().notebook.cellAt(target.index);
-  if (shouldFollowTargetCell(false)) {
+  if (!toBoolean(payload.noFollow, false) && shouldFollowTargetCell(false)) {
     await selectCell(getEditorOrThrow(), target.index, { reveal: true });
   }
   return okResponse("cell.replaceOutputs", {
@@ -1937,6 +2034,61 @@ async function clearOutputs(payload) {
     },
     { restoreSelection: toBoolean(payload.restoreSelection, false) }
   );
+}
+
+async function batchCellOperations(payload) {
+  const operations = arrayValue(payload.operations || payload.ops);
+  if (operations.length === 0) {
+    throw structuredError("BATCH_OPERATIONS_REQUIRED", "Batch operations are required");
+  }
+
+  const results = [];
+  for (const operation of operations) {
+    const kind = textValue(operation.op || operation.action);
+    const request = { ...operation, noFollow: operation.noFollow !== undefined ? operation.noFollow : true };
+    switch (kind) {
+      case "insert":
+        results.push(await insertCell(request, false));
+        break;
+      case "append":
+        results.push(await insertCell(request, true));
+        break;
+      case "update":
+        results.push(await updateCell(request));
+        break;
+      case "delete":
+        results.push(await deleteCells(request));
+        break;
+      case "move":
+        results.push(await moveCell(request));
+        break;
+      case "duplicate":
+        results.push(await duplicateCell(request));
+        break;
+      case "select":
+        results.push(await selectTargetCell(request, false));
+        break;
+      case "reveal":
+        results.push(await selectTargetCell(request, true));
+        break;
+      case "replaceOutputs":
+        results.push(await replaceOutputs(request));
+        break;
+      case "clearOutputs":
+        results.push(await clearOutputs(request));
+        break;
+      default:
+        throw structuredError("BATCH_OPERATION_NOT_SUPPORTED", `Unsupported batch operation: ${kind}`);
+    }
+  }
+
+  return okResponse("cell.batch", {
+    result: {
+      count: operations.length
+    },
+    results,
+    summary: `Applied ${operations.length} batch cell operation(s)`
+  }, { includeState: false });
 }
 
 async function runNotebookCommandWithLocator(operation, commandId, payload, options = {}) {
@@ -2038,19 +2190,30 @@ async function workflowUpdateAndRun(body) {
   if (toBoolean(body.clearOutputs, false)) {
     await clearOutputs(body);
   }
-  const execution = body.useCurrentSelection ? await runNotebookCommandWithLocator("workflow.updateAndRun", "notebook.cell.execute", body, { useCurrentSelection: true }) : await runNotebookCommandWithLocator("workflow.updateAndRun", "notebook.cell.execute", body);
-  const output = await readOutput(body);
+  const execution = body.useCurrentSelection
+    ? await runNotebookCommandWithLocator("workflow.updateAndRun", "notebook.cell.execute", body, { useCurrentSelection: true })
+    : await runNotebookCommandWithLocator("workflow.updateAndRun", "notebook.cell.execute", body);
+  const observe = normalizeObserveMode(body.observe);
+  const includeOutput = toBoolean(body.includeOutput, false);
+  let output = null;
+  if (includeOutput) {
+    output = await readOutput(body, { includeState: false });
+  } else if (observe === "outputSummary") {
+    output = await readOutput(body, { summaryOnly: true, includeState: false });
+  }
   return okResponse("workflow.updateAndRun", {
-    mutation: update.mutation,
-    execution: execution.execution,
-    cell: output.cell,
+    mutation: compactMutationResult(update),
+    execution: compactExecutionResult(execution, observe),
+    output,
     result: {
       mutationApplied: update.applied === true,
       executionAccepted: execution.accepted === true,
-      hasOutputs: output.hasOutputs
+      hasOutputs: output ? output.hasOutputs === true : null,
+      observe,
+      includeOutput
     },
     summary: "Updated and executed target cell through bridge"
-  });
+  }, { includeState: false });
 }
 
 async function workflowInsertAndRun(body) {
@@ -2060,32 +2223,73 @@ async function workflowInsertAndRun(body) {
     await clearOutputs({ index: targetIndex });
   }
   const execution = await runNotebookCommandWithLocator("workflow.insertAndRun", "notebook.cell.execute", { index: targetIndex });
-  const output = await readOutput({ index: targetIndex });
+  const observe = normalizeObserveMode(body.observe);
+  const includeOutput = toBoolean(body.includeOutput, false);
+  let output = null;
+  if (includeOutput) {
+    output = await readOutput({ index: targetIndex }, { includeState: false });
+  } else if (observe === "outputSummary") {
+    output = await readOutput({ index: targetIndex }, { summaryOnly: true, includeState: false });
+  }
   return okResponse("workflow.insertAndRun", {
-    mutation: insert.mutation,
-    execution: execution.execution,
-    cell: output.cell,
+    mutation: compactMutationResult(insert),
+    execution: compactExecutionResult(execution, observe),
+    output,
     result: {
       insertedIndex: targetIndex,
       mutationApplied: insert.applied === true,
       executionAccepted: execution.accepted === true,
-      hasOutputs: output.hasOutputs
+      hasOutputs: output ? output.hasOutputs === true : null,
+      observe,
+      includeOutput
     },
     summary: "Inserted and executed target cell through bridge"
-  });
+  }, { includeState: false });
 }
 
-async function readOutput(locator) {
+function normalizeObserveMode(value) {
+  const mode = textValue(value, "completion");
+  return ["none", "completion", "outputSummary"].includes(mode) ? mode : "completion";
+}
+
+function compactMutationResult(response) {
+  return {
+    operation: response.operation || null,
+    applied: response.applied === true,
+    identityStable: response.identityStable !== false,
+    cell: response.cell || null,
+    summary: response.summary || null
+  };
+}
+
+function compactExecutionResult(response, observe = "completion") {
+  return {
+    operation: response.operation || null,
+    accepted: response.accepted === true,
+    pendingObservation: response.pendingObservation === true,
+    completionObserved: observe === "none" ? null : response.completionObserved === true,
+    outputObserved: observe === "outputSummary" ? response.outputObserved === true : null,
+    identityStable: response.identityStable !== false,
+    selection: response.selection || [],
+    cell: response.cell || null,
+    summary: response.summary || null
+  };
+}
+
+async function readOutput(locator, options = {}) {
   const active = getEditorOrThrow();
   const target = findCell(active, locator);
+  const summaryOnly = options.summaryOnly === true;
   const cell = serializeCell(target.cell, target.index, {
     includeSource: false,
     includeMetadata: false,
-    includeOutputs: true,
-    outputTextLimit: 4000
+    includeOutputs: !summaryOnly,
+    outputTextLimit: summaryOnly ? 300 : 4000
   });
   const runtime = activeRuntime(active);
-  const hasOutputs = Array.isArray(cell.outputs) && cell.outputs.length > 0;
+  const hasOutputs = Array.isArray(target.cell.outputs) && target.cell.outputs.length > 0;
+  const outputSummary = cellOutputSummary(target.cell);
+  const hasError = cellHasErrorOutput(target.cell);
   const inferred = inferredExecutionObservation(active);
   const observedFromBridgeExecution = Boolean(
     bridgeState.lastExecution &&
@@ -2093,17 +2297,42 @@ async function readOutput(locator) {
     inferred.outputObserved &&
     (!runtime || runtime.lastObservedCellIds.length === 0 || runtime.lastObservedCellIds.includes(cell.id))
   );
-  return okResponse("output", {
+  const payload = {
     cell,
     hasOutputs,
+    hasError,
+    outputSummary,
     observedFromBridgeExecution,
     summary: `Collected outputs for cell ${target.index}`
+  };
+  if (summaryOnly) {
+    delete payload.cell.outputs;
+    return okResponse("output.summary", payload, {
+      includeState: options.includeState !== false ? true : false
+    });
+  }
+  return okResponse("output", payload, {
+    includeState: options.includeState !== false ? true : false
   });
 }
 
 async function httpGet(url) {
   const editor = activeNotebookEditor();
   switch (url.pathname) {
+    case "/status/brief":
+      return okResponse("status.brief", {
+        notebook: activeNotebookInfo(editor),
+        window: windowIdentity(),
+        server: {
+          host: bridgeState.server.host || getServerConfig().host,
+          port: bridgeState.server.port || getServerConfig().port,
+          basePort: getServerConfig().port,
+          portSpan: getServerConfig().portSpan,
+          baseUrl: currentServerBaseUrl()
+        },
+        status: briefState(editor),
+        summary: "Collected brief bridge status"
+      }, { includeState: false });
     case "/status":
       return okResponse("status", {
         server: {
@@ -2185,6 +2414,14 @@ async function httpGet(url) {
     case "/kernel":
     case "/kernel/state":
       return okResponse("kernel.state", { kernel: kernelState(editor) });
+    case "/output/summary":
+      return readOutput({
+        index: url.searchParams.get("index"),
+        cellId: url.searchParams.get("cellId"),
+        id: url.searchParams.get("id"),
+        marker: url.searchParams.get("marker"),
+        selection: url.searchParams.get("selection")
+      }, { summaryOnly: true, includeState: false });
     case "/output": {
       return readOutput({
         index: url.searchParams.get("index"),
@@ -2241,6 +2478,8 @@ async function httpPost(url, body) {
     case "/cell/clearOutputs":
     case "/output/clear":
       return clearOutputs(body);
+    case "/cell/batch":
+      return batchCells(body);
     case "/workflow/updateAndRun":
       return workflowUpdateAndRun(body);
     case "/workflow/insertAndRun":

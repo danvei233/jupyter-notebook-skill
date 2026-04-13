@@ -21,20 +21,24 @@ Make notebook work feel like real analysis:
 - continue
 - write conclusions from observed results
 
+This is smart streaming, not mechanical over-checking.
+
 ### Required behavior
 
 1. Build the notebook in stages, not in one giant pass.
 2. Run setup/import cells before later stages depend on them.
-3. Add one analytical block at a time.
+3. Add one analytical block at a time, usually 2-4 related cells per stage.
 4. Run only the new block or directly dependent cells.
-5. Inspect `/execution/state` and `/output` before moving on.
-6. Add or revise conclusions after outputs exist.
+5. Default to `GET /status/brief`, `/workflow/*`, and `/output/summary` for normal stages.
+6. Escalate to full `/status` + `/compliance` + `/context` only for high-risk steps.
+7. Add or revise conclusions after outputs exist.
 
 ### Avoid
 
 - dumping title, markdown narrative, all code, and final conclusions in one pass
 - using `/run/all` as the first meaningful validation step
 - pre-writing conclusions that depend on metrics, plots, or model results not yet observed
+- rereading full context before every low-risk mutation
 
 ### When `/run/all` is acceptable
 
@@ -49,9 +53,19 @@ Use this only when the user explicitly wants Codex's native freeform approach.
 
 - keep bridge-first mutation/execution rules
 - keep notebook identity/state checks
+- prefer light checks such as `/status/brief` unless risk is high
 - otherwise allow normal judgment about writing order, structure, and execution order
 
 ### Still avoid
 
 - silent fallback away from bridge
 - false claims about outputs or execution state
+
+## When To Avoid Heavy Notebook Workflow
+
+Prefer `blank` mode or file-only notebook generation when:
+
+- the user only wants a static notebook template
+- the task is mostly markdown editing or title cleanup
+- the target is not the active notebook
+- live kernel state and live outputs are irrelevant

@@ -13,6 +13,7 @@ Use the local VS Code Data Bridge as the default control plane for notebook work
 - Do not silently fall back to `.py` generators, `nbclient`, `nbconvert`, or direct `.ipynb` rewriting.
 - Do not claim a cell ran or produced outputs unless bridge-backed execution or direct bridge output reads confirm it.
 - PowerShell is forbidden for this skill. Use `scripts/bridgectl.exe`.
+- Do not improvise `bridgectl` syntax. The only valid CLI shape is `bridgectl.exe -method <METHOD> -path <ROUTE>`, optionally plus `-body` or `-body-file`.
 - If temporary JSON request bodies are needed for `bridgectl -body-file`, store them under `./tmp/bridgebody/` in the current working directory, not in the project root.
 - For multi-line source, long markdown, or larger JSON payloads, default to `bridgectl -body-file` instead of inline `-body`.
 
@@ -24,9 +25,10 @@ Default mode: `streaming-analysis`.
 
 Use this unless the user explicitly asks for something looser.
 
-- Write a small stage.
-- Run that stage.
-- Inspect outputs/state.
+- Use smart streaming, not mechanical over-checking.
+- Write one small stage or one coherent phase.
+- Run that phase.
+- Inspect the smallest useful result.
 - Adjust code or continue.
 - Generate conclusions from observed results, not from assumptions.
 - Do not default to writing the full notebook and then finishing with `/run/all`.
@@ -42,7 +44,7 @@ Read [references/workflow-modes.md](references/workflow-modes.md) for the full m
 
 ## First Moves
 
-Before any write, run, or debug action:
+Before high-risk write, run, or debug action:
 
 1. `GET /status`
 2. `GET /compliance`
@@ -56,6 +58,15 @@ Confirm:
 - cell count
 
 Use `GET /servers` when multiple windows or bridge servers may be involved.
+
+For normal work, prefer risk-based checks:
+
+- Low risk: stable notebook identity, known `index`, mutation only.
+  Use cached bridge identity plus `/cell/update`, `/cell/insert`, `/cell/batch`.
+- Medium risk: mutation plus targeted run on a known cell.
+  Use `GET /status/brief` once, then `/workflow/updateAndRun` or `/workflow/insertAndRun`.
+- High risk: marker lookup, notebook ambiguity, kernel lifecycle, `run all`, debugging, or drift suspicion.
+  Use full `/status` + `/compliance` + `/context`.
 
 ## Structure Rules
 
@@ -76,14 +87,18 @@ When using `matplotlib` / `plt`, apply the default style contract unless the use
 - UTF-8-safe Chinese support enabled
 - axes spines width `1.5`
 - titles, axis titles, and tick labels bold
+- Add one dedicated plotting-style setup cell before the first real chart cell
+- Do not emit a chart cell until that style setup cell exists in the notebook
+- Do not rely on matplotlib defaults after the setup cell is present; each chart must call the shared style helper
 
 Read [references/plotting-style.md](references/plotting-style.md) for the reusable setup cell.
 
 ## High-Value Paths
 
-- Read state: `GET /status`, `GET /compliance`, `GET /context`, `GET /output`
+- Read light state: `GET /status/brief`, `GET /output/summary`
+- Read full state: `GET /status`, `GET /compliance`, `GET /context`, `GET /output`
 - Discover windows/servers: `GET /servers`
-- Edit cells: `/cell/insert`, `/cell/append`, `/cell/update`, `/cell/move`, `/cell/delete`
+- Edit cells: `/cell/insert`, `/cell/append`, `/cell/update`, `/cell/move`, `/cell/delete`, `/cell/batch`
 - Atomic workflows: `/workflow/updateAndRun`, `/workflow/insertAndRun`
 - Run targeted cells: `/run/current`, `/run/cell`, `/run/above`, `/run/below`
 - Debug: `/debug/cell`, `/debug/continue`, `/debug/stepOver`, `/debug/stop`
@@ -96,9 +111,20 @@ Read [references/common-recipes.md](references/common-recipes.md) for task recip
 
 - If locator lookup fails, strengthen the locator: `index` > `selection=current` > precise marker.
 - If marker matches multiple cells, do not guess.
-- If state is stale, re-read `/status` or `/context`.
+- If state is stale, re-read `/status/brief` first, then `/status` or `/context` if needed.
 - If bridge mutation or execution fails, diagnose bridge first. Do not switch paths silently.
 - `kernel/shutdown` is currently unsupported.
+
+## Do Not Overuse Heavy Mode
+
+Prefer `blank` mode or file-only notebook generation when:
+
+- the user only wants a static `.ipynb` template
+- the task is mainly markdown restructuring or title cleanup
+- the target is not the active notebook
+- live kernel state and live outputs are irrelevant
+
+Do not mix control-center polling into normal notebook execution work unless the user explicitly wants server or UI status.
 
 Read:
 
