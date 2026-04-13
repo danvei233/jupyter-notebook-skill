@@ -1,0 +1,109 @@
+{
+  "name": "vscode-data-bridge",
+  "displayName": "VSCode Data Bridge",
+  "description": "Local command bridge for Jupyter, notebooks, and data-analysis workflows in VS Code.",
+  "version": "0.0.1",
+  "publisher": "local",
+  "engines": {
+    "vscode": "^1.106.0"
+  },
+  "categories": [
+    "Other",
+    "Data Science",
+    "Notebooks"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onCommand:dataBridge.startServer",
+    "onCommand:dataBridge.stopServer",
+    "onCommand:dataBridge.showStatus",
+    "onCommand:dataBridge.copyServerConfig",
+    "onCommand:dataBridge.listCommands",
+    "onCommand:dataBridge.runNotebookCommand",
+    "onCommand:dataBridge.executeCellByIndex"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "dataBridge.startServer",
+        "title": "Data Bridge: Start Server"
+      },
+      {
+        "command": "dataBridge.stopServer",
+        "title": "Data Bridge: Stop Server"
+      },
+      {
+        "command": "dataBridge.showStatus",
+        "title": "Data Bridge: Show Status"
+      },
+      {
+        "command": "dataBridge.copyServerConfig",
+        "title": "Data Bridge: Copy Server Config"
+      },
+      {
+        "command": "dataBridge.listCommands",
+        "title": "Data Bridge: List Commands"
+      },
+      {
+        "command": "dataBridge.runNotebookCommand",
+        "title": "Data Bridge: Run Notebook Command"
+      },
+      {
+        "command": "dataBridge.executeCellByIndex",
+        "title": "Data Bridge: Execute Cell By Index"
+      }
+    ],
+    "configuration": {
+      "title": "VSCode Data Bridge",
+      "properties": {
+        "dataBridge.host": {
+          "type": "string",
+          "default": "127.0.0.1",
+          "description": "Host address for the local bridge server."
+        },
+        "dataBridge.port": {
+          "type": "number",
+          "default": 8765,
+          "description": "Port for the local bridge server."
+        },
+        "dataBridge.autoStart": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically start the bridge server when the extension activates."
+        },
+        "dataBridge.token": {
+          "type": "string",
+          "default": "",
+          "description": "Optional bearer token required by the local bridge server."
+        },
+        "dataBridge.allowArbitraryCommands": {
+          "type": "boolean",
+          "default": false,
+          "description": "Allow executing any VS Code command. When false, only notebook and data-analysis commands are allowed."
+        },
+        "dataBridge.allowedCommandPrefixes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "jupyter.",
+            "notebook.",
+            "interactive.",
+            "workbench.action.notebook.",
+            "ipynb.",
+            "vscode.executeData"
+          ],
+          "description": "Allowed command ID prefixes when arbitrary commands are disabled."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "package": "npx @vscode/vsce package"
+  },
+  "devDependencies": {
+    "@vscode/vsce": "^3.6.0"
+  }
+}
