@@ -1,7 +1,7 @@
 {
   "name": "vscode-data-bridge",
   "displayName": "VSCode Data Bridge",
-  "description": "Local command bridge for Jupyter, notebooks, and data-analysis workflows in VS Code.",
+  "description": "%extension.description%",
   "version": "0.0.1",
   "publisher": "local",
   "engines": {
@@ -14,10 +14,13 @@
   ],
   "activationEvents": [
     "onStartupFinished",
+    "onView:dataBridge.controlCenter",
     "onCommand:dataBridge.startServer",
     "onCommand:dataBridge.stopServer",
     "onCommand:dataBridge.showStatus",
     "onCommand:dataBridge.copyServerConfig",
+    "onCommand:dataBridge.openControlCenter",
+    "onCommand:dataBridge.refreshControlCenter",
     "onCommand:dataBridge.listCommands",
     "onCommand:dataBridge.runNotebookCommand",
     "onCommand:dataBridge.executeCellByIndex"
@@ -26,61 +29,107 @@
   "contributes": {
     "commands": [
       {
+        "command": "dataBridge.openControlCenter",
+        "title": "%command.openControlCenter%"
+      },
+      {
+        "command": "dataBridge.refreshControlCenter",
+        "title": "%command.refreshControlCenter%"
+      },
+      {
         "command": "dataBridge.startServer",
-        "title": "Data Bridge: Start Server"
+        "title": "%command.startServer%"
       },
       {
         "command": "dataBridge.stopServer",
-        "title": "Data Bridge: Stop Server"
+        "title": "%command.stopServer%"
       },
       {
         "command": "dataBridge.showStatus",
-        "title": "Data Bridge: Show Status"
+        "title": "%command.showStatus%"
       },
       {
         "command": "dataBridge.copyServerConfig",
-        "title": "Data Bridge: Copy Server Config"
+        "title": "%command.copyServerConfig%"
       },
       {
         "command": "dataBridge.listCommands",
-        "title": "Data Bridge: List Commands"
+        "title": "%command.listCommands%"
       },
       {
         "command": "dataBridge.runNotebookCommand",
-        "title": "Data Bridge: Run Notebook Command"
+        "title": "%command.runNotebookCommand%"
       },
       {
         "command": "dataBridge.executeCellByIndex",
-        "title": "Data Bridge: Execute Cell By Index"
+        "title": "%command.executeCellByIndex%"
       }
     ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "dataBridgeSidebar",
+          "title": "%viewContainer.title%",
+          "icon": "media/data-bridge.svg"
+        }
+      ]
+    },
+    "views": {
+      "dataBridgeSidebar": [
+        {
+          "type": "webview",
+          "id": "dataBridge.controlCenter",
+          "name": "%view.controlCenter%"
+        }
+      ]
+    },
     "configuration": {
-      "title": "VSCode Data Bridge",
+      "title": "%configuration.title%",
       "properties": {
         "dataBridge.host": {
           "type": "string",
           "default": "127.0.0.1",
-          "description": "Host address for the local bridge server."
+          "description": "%config.host.description%"
         },
         "dataBridge.port": {
           "type": "number",
           "default": 8765,
-          "description": "Port for the local bridge server."
+          "description": "%config.port.description%"
+        },
+        "dataBridge.portSpan": {
+          "type": "number",
+          "default": 20,
+          "description": "%config.portSpan.description%"
         },
         "dataBridge.autoStart": {
           "type": "boolean",
           "default": true,
-          "description": "Automatically start the bridge server when the extension activates."
+          "description": "%config.autoStart.description%"
+        },
+        "dataBridge.followTargetCell": {
+          "type": "boolean",
+          "default": true,
+          "description": "%config.followTargetCell.description%"
+        },
+        "dataBridge.controlCenterAutoRefresh": {
+          "type": "boolean",
+          "default": true,
+          "description": "%config.controlCenterAutoRefresh.description%"
+        },
+        "dataBridge.controlCenterRefreshIntervalMs": {
+          "type": "number",
+          "default": 3000,
+          "description": "%config.controlCenterRefreshIntervalMs.description%"
         },
         "dataBridge.token": {
           "type": "string",
           "default": "",
-          "description": "Optional bearer token required by the local bridge server."
+          "description": "%config.token.description%"
         },
         "dataBridge.allowArbitraryCommands": {
           "type": "boolean",
           "default": false,
-          "description": "Allow executing any VS Code command. When false, only notebook and data-analysis commands are allowed."
+          "description": "%config.allowArbitraryCommands.description%"
         },
         "dataBridge.allowedCommandPrefixes": {
           "type": "array",
@@ -95,7 +144,7 @@
             "ipynb.",
             "vscode.executeData"
           ],
-          "description": "Allowed command ID prefixes when arbitrary commands are disabled."
+          "description": "%config.allowedCommandPrefixes.description%"
         }
       }
     }

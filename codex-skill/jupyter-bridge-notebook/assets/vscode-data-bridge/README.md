@@ -45,6 +45,19 @@ Bridge-first compliance is surfaced through `GET /compliance`, and common mutati
 - `POST /workflow/updateAndRun`
 - `POST /workflow/insertAndRun`
 
+Lightweight routes are also available for faster clients:
+
+- `GET /status/brief`
+- `GET /output/summary`
+- `POST /cell/batch`
+
+The workflow endpoints accept lighter observation controls:
+
+- `observe`: `none | completion | outputSummary`
+- `includeOutput`: default `false`
+
+`POST /kernel/shutdown` is intentionally declared but currently unsupported.
+
 ## Control Center Sidebar
 
 The extension contributes a `Data Bridge` sidebar with a `Control Center` view. It shows:
@@ -67,9 +80,19 @@ If you prefer the secondary sidebar on the right, move the `Data Bridge` view co
 
 ## HTTP API
 
+The repository truth source for route status and MCP tool mapping is:
+
+```text
+..\internal\bridgecatalog\capabilities.json
+```
+
 ### `GET /status`
 
 Returns bridge status and active notebook metadata.
+
+### `GET /status/brief`
+
+Returns lightweight notebook identity, server, and busy/idle state.
 
 ### `GET /servers`
 
@@ -78,6 +101,14 @@ Returns the local bridge server list discovered across the configured host and p
 ### `GET /commands`
 
 Returns the built-in quick command list.
+
+### `GET /output/summary`
+
+Returns lightweight output summary for a target cell.
+
+### `POST /cell/batch`
+
+Applies several cell mutations in one request.
 
 ### `POST /execute`
 
@@ -97,3 +128,5 @@ bridgectl.exe -method POST -path /execute -body "{\"command\":\"jupyter.runcell\
 ```
 
 If `dataBridge.token` is set, pass `-token YOUR_TOKEN` to `bridgectl.exe`.
+
+The recommended high-level client is the stdio MCP server `jupyterbridge-mcp.exe`; use `bridgectl.exe` for low-level diagnostics, installs, and direct HTTP troubleshooting.

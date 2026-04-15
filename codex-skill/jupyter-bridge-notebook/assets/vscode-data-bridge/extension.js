@@ -965,8 +965,44 @@ function executionSummary(cell) {
   };
 }
 
+function stableHash(value) {
+  const text = typeof value === "string" ? value : JSON.stringify(value || {});
+  let hash = 2166136261;
+  for (let i = 0; i < text.length; i += 1) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(16);
+}
+
 function cellId(cell) {
   return cell.document.uri.toString();
+}
+
+function cellReadToken(cell, index) {
+  return [
+    cellId(cell),
+    index,
+    stableHash(cell.document.getText()),
+    stableHash(cell.metadata || {}),
+    (cell.outputs || []).length
+  ].join(":");
+}
+
+function assertReadTokenMatches(cell, index, payload = {}) {
+  const expected = textValue(payload.readToken || payload.expectedReadToken || payload.ifMatchReadToken);
+  if (!expected) {
+    return;
+  }
+  const actual = cellReadToken(cell, index);
+  if (expected !== actual) {
+    throw structuredError("CELL_STALE_READ", `Cell ${index} changed since it was last read`, {
+      index,
+      cellId: cellId(cell),
+      expectedReadToken: expected,
+      actualReadToken: actual
+    });
+  }
 }
 
 function notebookUri(editorOrNotebook) {
@@ -1186,6 +1222,7 @@ function serializeCell(cell, index, options = {}) {
   return {
     index,
     id: cellId(cell),
+    readToken: cellReadToken(cell, index),
     kind: cell.kind === vscode.NotebookCellKind.Markup ? "markdown" : "code",
     languageId: cell.document.languageId,
     source: options.includeSource === false ? undefined : source,
@@ -1760,13 +1797,14 @@ async function executeCellByIndex(index, options = {}) {
         kind: "execution",
         target: { index: target.index, id: cellId(target.cell) }
       });
+      const targetId = cellId(target.cell);
       return okResponse("executeCellByIndex", {
-        cell: serializeCell(target.cell, target.index),
-        selection: activeNotebookInfo(editor).selection,
+        index: target.index,
+        cellId: targetId,
         accepted: true,
         pendingObservation: true,
         summary: `Execution requested for cell ${target.index}`
-      });
+      }, { includeState: false });
     },
     { restoreSelection: toBoolean(options.restoreSelection, false) }
   );
@@ -1806,20 +1844,24 @@ async function insertCell(payload, append = false) {
   };
   const updatedEditor = getEditorOrThrow();
   const insertedCell = updatedEditor.notebook.cellAt(index);
+  const insertedId = cellId(insertedCell);
   if (!toBoolean(payload.noFollow, false) && shouldFollowTargetCell(false)) {
     await selectCell(updatedEditor, index, { reveal: true });
   }
   return okResponse(append ? "cell.append" : "cell.insert", {
-    cell: serializeCell(insertedCell, index),
+    index,
+    cellId: insertedId,
+    cell: toBoolean(payload.includeCell, false) ? compactCellSummary(serializeCell(insertedCell, index)) : undefined,
     applied: true,
     identityStable: true,
     summary: `${append ? "Appended" : "Inserted"} cell at ${index}`
-  });
+  }, { includeState: false });
 }
 
 async function updateCell(payload) {
   const editor = getEditorOrThrow();
   const target = findCell(editor, payload);
+  assertReadTokenMatches(target.cell, target.index, payload);
   const nextData = cloneCellData(target.cell, {
     kind: payload.kind,
     source: payload.source !== undefined ? payload.source : target.cell.document.getText(),
@@ -1837,15 +1879,18 @@ async function updateCell(payload) {
     lastMutationObservedAt: new Date().toISOString()
   };
   const refreshedCell = getEditorOrThrow().notebook.cellAt(target.index);
+  const refreshedId = cellId(refreshedCell);
   if (!toBoolean(payload.noFollow, false) && shouldFollowTargetCell(false)) {
     await selectCell(getEditorOrThrow(), target.index, { reveal: true });
   }
   return okResponse("cell.update", {
-    cell: serializeCell(refreshedCell, target.index),
+    index: target.index,
+    cellId: refreshedId,
+    cell: toBoolean(payload.includeCell, false) ? compactCellSummary(serializeCell(refreshedCell, target.index)) : undefined,
     applied: true,
     identityStable: true,
     summary: `Updated cell ${target.index}`
-  });
+  }, { includeState: false });
 }
 
 async function deleteCells(payload) {
@@ -1856,6 +1901,7 @@ async function deleteCells(payload) {
     .sort((a, b) => a - b);
   if (indexes.length === 0) {
     const target = findCell(editor, payload);
+    assertReadTokenMatches(target.cell, target.index, payload);
     indexes.push(target.index);
   }
   const uniqueIndexes = [...new Set(indexes)];
@@ -1881,12 +1927,13 @@ async function deleteCells(payload) {
   return okResponse("cell.delete", {
     result: { deletedIndexes: uniqueIndexes },
     summary: `Deleted ${uniqueIndexes.length} cell(s)`
-  });
+  }, { includeState: false });
 }
 
 async function moveCell(payload) {
   const editor = getEditorOrThrow();
   const target = findCell(editor, payload);
+  assertReadTokenMatches(target.cell, target.index, payload);
   const allCells = getNotebookCells(editor);
   const destinationIndex =
     payload.toIndex !== undefined
@@ -1918,14 +1965,16 @@ async function moveCell(payload) {
     await selectCell(getEditorOrThrow(), destinationIndex, { reveal: true });
   }
   return okResponse("cell.move", {
+    index: destinationIndex,
     result: { from: target.index, to: destinationIndex },
     summary: `Moved cell ${target.index} to ${destinationIndex}`
-  });
+  }, { includeState: false });
 }
 
 async function duplicateCell(payload) {
   const editor = getEditorOrThrow();
   const target = findCell(editor, payload);
+  assertReadTokenMatches(target.cell, target.index, payload);
   const duplicate = cloneCellData(target.cell);
   const insertIndex = toInteger(payload.toIndex, target.index + 1);
   await applyNotebookCellReplacement(editor, insertIndex, insertIndex, [duplicate]);
@@ -1941,13 +1990,16 @@ async function duplicateCell(payload) {
     lastMutationObservedAt: new Date().toISOString()
   };
   const inserted = getEditorOrThrow().notebook.cellAt(insertIndex);
+  const insertedId = cellId(inserted);
   if (!toBoolean(payload.noFollow, false) && shouldFollowTargetCell(false)) {
     await selectCell(getEditorOrThrow(), insertIndex, { reveal: true });
   }
   return okResponse("cell.duplicate", {
-    cell: serializeCell(inserted, insertIndex),
+    index: insertIndex,
+    cellId: insertedId,
+    cell: toBoolean(payload.includeCell, false) ? compactCellSummary(serializeCell(inserted, insertIndex)) : undefined,
     summary: `Duplicated cell ${target.index} to ${insertIndex}`
-  });
+  }, { includeState: false });
 }
 
 async function selectTargetCell(payload, revealOnly = false) {
@@ -1961,15 +2013,18 @@ async function selectTargetCell(payload, revealOnly = false) {
     await revealCellSmoothly(editor, target.index, { forceReveal: true });
   }
   return okResponse(revealOnly ? "cell.reveal" : "cell.select", {
-    cell: serializeCell(target.cell, target.index),
+    index: target.index,
+    cellId: cellId(target.cell),
     selection: activeNotebookInfo(editor).selection,
+    cell: toBoolean(payload.includeCell, false) ? compactCellSummary(serializeCell(target.cell, target.index)) : undefined,
     summary: `${revealOnly ? "Revealed" : "Selected"} cell ${target.index}`
-  });
+  }, { includeState: false });
 }
 
 async function replaceOutputs(payload) {
   const editor = getEditorOrThrow();
   const target = findCell(editor, payload);
+  assertReadTokenMatches(target.cell, target.index, payload);
   const outputs = buildOutputs(payload.outputs || []);
   await applyNotebookMetadataEdit(editor, [vscode.NotebookEdit.updateCellOutputs(target.index, outputs)]);
   bridgeState.lastMutation = {
@@ -1987,9 +2042,11 @@ async function replaceOutputs(payload) {
     await selectCell(getEditorOrThrow(), target.index, { reveal: true });
   }
   return okResponse("cell.replaceOutputs", {
-    cell: serializeCell(refreshedCell, target.index),
+    index: target.index,
+    cellId: cellId(refreshedCell),
+    cell: toBoolean(payload.includeCell, false) ? compactCellSummary(serializeCell(refreshedCell, target.index)) : undefined,
     summary: `Replaced outputs for cell ${target.index}`
-  });
+  }, { includeState: false });
 }
 
 async function clearOutputs(payload) {
@@ -2009,12 +2066,13 @@ async function clearOutputs(payload) {
     return okResponse("cell.clearOutputs", {
       result: { all: true },
       summary: "Cleared outputs for all cells"
-    });
+    }, { includeState: false });
   }
   return withCellSelection(
     editor,
     payload,
     async (target) => {
+      assertReadTokenMatches(target.cell, target.index, payload);
       await executeCommand("notebook.cell.clearOutputs", [], { kind: "notebook" });
       bridgeState.lastMutation = {
         operation: "cell.clearOutputs",
@@ -2028,66 +2086,484 @@ async function clearOutputs(payload) {
       };
       const refreshed = getEditorOrThrow().notebook.cellAt(target.index);
       return okResponse("cell.clearOutputs", {
-        cell: serializeCell(refreshed, target.index),
+        index: target.index,
+        cellId: cellId(refreshed),
+        cell: toBoolean(payload.includeCell, false) ? compactCellSummary(serializeCell(refreshed, target.index)) : undefined,
         summary: `Cleared outputs for cell ${target.index}`
-      });
+      }, { includeState: false });
     },
     { restoreSelection: toBoolean(payload.restoreSelection, false) }
   );
 }
 
-async function batchCellOperations(payload) {
+function cloneNotebookValue(value, fallback = {}) {
+  if (value === undefined || value === null) {
+    return Array.isArray(fallback) ? [...fallback] : { ...fallback };
+  }
+  try {
+    return JSON.parse(JSON.stringify(value));
+  } catch {
+    return value;
+  }
+}
+
+function notebookCellStateFromCell(cell) {
+  return {
+    id: cellId(cell) || cell.metadata?.id || null,
+    kind: cell.kind === vscode.NotebookCellKind.Markup ? "markdown" : "code",
+    languageId: cell.document.languageId || notebookLanguage(cell.kind),
+    source: cell.document.getText(),
+    metadata: cloneNotebookValue(cell.metadata || {}),
+    outputs: Array.isArray(cell.outputs) ? cell.outputs.slice() : []
+  };
+}
+
+function cloneNotebookCellState(state) {
+  return {
+    id: state.id || state.metadata?.id || null,
+    kind: state.kind,
+    languageId: state.languageId || notebookLanguage(state.kind),
+    source: normalizeSource(state.source),
+    metadata: cloneNotebookValue(state.metadata || {}),
+    outputs: Array.isArray(state.outputs) ? state.outputs.slice() : []
+  };
+}
+
+function notebookCellDataFromState(state) {
+  const kind = notebookKind(state.kind);
+  const cellData = new vscode.NotebookCellData(kind, normalizeSource(state.source), textValue(state.languageId, notebookLanguage(kind)));
+  cellData.metadata = cloneNotebookValue(state.metadata || {});
+  cellData.outputs = Array.isArray(state.outputs) ? state.outputs.slice() : [];
+  return cellData;
+}
+
+function summarizedStateCell(state, index) {
+  return {
+    index,
+    id: state.id || state.metadata?.id || null,
+    kind: state.kind,
+    languageId: state.languageId || notebookLanguage(state.kind),
+    sourceSummary: normalizeSource(state.source).slice(0, 240),
+    outputSummary: (state.outputs || []).map((output) => summarizeOutput(output)),
+    executionSummary: {
+      executionOrder: null,
+      success: null,
+      timing: null
+    }
+  };
+}
+
+function batchSelectionIndex(editor) {
+  const current = editor && editor.selections && editor.selections[0];
+  return current ? current.start : null;
+}
+
+function findStateCell(states, locator = {}, options = {}) {
+  const selection = textValue(locator.selection);
+  if (selection === "current") {
+    const selectionIndex = options.selectionIndex;
+    if (selectionIndex === null || selectionIndex === undefined) {
+      throw structuredError("NO_SELECTION", "No selected notebook cell");
+    }
+    const cell = states[selectionIndex];
+    if (!cell) {
+      throw structuredError("NO_SELECTION", "Selected notebook cell is out of range");
+    }
+    return { cell, index: selectionIndex };
+  }
+
+  const index = toInteger(locator.index);
+  if (index !== null) {
+    if (index < 0 || index >= states.length) {
+      throw structuredError("CELL_INDEX_OUT_OF_RANGE", `Cell index out of range: ${index}`);
+    }
+    return { cell: states[index], index };
+  }
+
+  const desiredId = locator.id || locator.cellId;
+  if (desiredId) {
+    const matchIndex = states.findIndex((cell) => (cell.id || cell.metadata?.id) === desiredId);
+    if (matchIndex === -1) {
+      throw structuredError("CELL_NOT_FOUND", `Unable to find cell: ${desiredId}`);
+    }
+    return { cell: states[matchIndex], index: matchIndex };
+  }
+
+  const marker = locator.marker;
+  if (marker) {
+    const matches = states
+      .map((cell, cellIndex) => ({ cell, index: cellIndex }))
+      .filter((entry) => normalizeSource(entry.cell.source).includes(marker));
+    if (matches.length === 0) {
+      throw structuredError("CELL_MARKER_NOT_FOUND", `No cell matched marker: ${marker}`);
+    }
+    if (matches.length > 1 && !options.allowMultipleMarkers) {
+      throw structuredError("CELL_MARKER_AMBIGUOUS", `Marker matched multiple cells: ${marker}`);
+    }
+    return matches[0];
+  }
+
+  throw structuredError("CELL_LOCATOR_REQUIRED", "A cell locator is required");
+}
+
+function resolveDeleteIndexesFromState(states, payload, selectionIndex) {
+  const indexes = arrayValue(payload.indexes || payload.indices || payload.index)
+    .map((value) => toInteger(value))
+    .filter((value) => value !== null)
+    .sort((a, b) => a - b);
+  if (indexes.length === 0) {
+    const target = findStateCell(states, payload, { selectionIndex });
+    indexes.push(target.index);
+  }
+  const uniqueIndexes = [...new Set(indexes)];
+  for (const index of uniqueIndexes) {
+    if (index < 0 || index >= states.length) {
+      throw structuredError("CELL_INDEX_OUT_OF_RANGE", `Cell index out of range: ${index}`);
+    }
+  }
+  return uniqueIndexes;
+}
+
+function adjustSelectionAfterDelete(selectionIndex, deletedIndexes, nextLength) {
+  if (selectionIndex === null || selectionIndex === undefined) {
+    return selectionIndex;
+  }
+  if (nextLength === 0) {
+    return null;
+  }
+  const removedBefore = deletedIndexes.filter((index) => index < selectionIndex).length;
+  if (deletedIndexes.includes(selectionIndex)) {
+    const firstDeleted = deletedIndexes[0];
+    return Math.min(firstDeleted - removedBefore, nextLength - 1);
+  }
+  return Math.min(selectionIndex - removedBefore, nextLength - 1);
+}
+
+function compactCellSummary(cell) {
+  if (!cell) {
+    return null;
+  }
+  return {
+    index: cell.index ?? null,
+    id: cell.id ?? null,
+    kind: cell.kind ?? null,
+    languageId: cell.languageId ?? null,
+    sourceSummary: cell.sourceSummary ?? null,
+    outputSummary: cell.outputSummary ?? [],
+    executionSummary: cell.executionSummary || null
+  };
+}
+
+function compactBatchResult(response) {
+  const compact = {
+    operation: response.operation || null,
+    applied: response.applied !== false,
+    identityStable: response.identityStable !== false,
+    summary: response.summary || null
+  };
+  if (response.cell) {
+    compact.cell = compactCellSummary(response.cell);
+    compact.index = compact.cell.index;
+    compact.cellId = compact.cell.id;
+  }
+  if (response.result) {
+    compact.result = response.result;
+  }
+  if (response.selection) {
+    compact.selection = response.selection;
+  }
+  return compact;
+}
+
+function normalizeBatchMode(value) {
+  const mode = textValue(value, "transactional");
+  return ["transactional", "bestEffort"].includes(mode) ? mode : "transactional";
+}
+
+function createBatchInsertState(request, append, states) {
+  const index = append ? states.length : toInteger(request.index, states.length);
+  if (index < 0 || index > states.length) {
+    throw structuredError("CELL_INDEX_OUT_OF_RANGE", `Cell index out of range: ${index}`);
+  }
+  const kind = notebookKind(request.kind) === vscode.NotebookCellKind.Markup ? "markdown" : "code";
+  const metadata = cloneNotebookValue(request.metadata || {});
+  const state = {
+    id: metadata.id || null,
+    kind,
+    languageId: textValue(request.languageId, notebookLanguage(kind)),
+    source: normalizeSource(request.source),
+    metadata,
+    outputs: []
+  };
+  states.splice(index, 0, state);
+  return { state, index };
+}
+
+function applyBatchOperationToState(states, operation, batchState) {
+  const kind = textValue(operation.op || operation.action);
+  const request = { ...operation, noFollow: true };
+  switch (kind) {
+    case "insert":
+    case "append": {
+      const { state, index } = createBatchInsertState(request, kind === "append", states);
+      batchState.mutated = true;
+      return {
+        operation: kind === "append" ? "cell.append" : "cell.insert",
+        applied: true,
+        identityStable: true,
+        cell: summarizedStateCell(state, index),
+        summary: `${kind === "append" ? "Appended" : "Inserted"} cell at ${index}`
+      };
+    }
+    case "update": {
+      const target = findStateCell(states, request, { selectionIndex: batchState.selectionIndex });
+      if (request.readToken || request.expectedReadToken || request.ifMatchReadToken) {
+        const actualToken = [
+          target.cell.id || target.cell.metadata?.id || null,
+          target.index,
+          stableHash(normalizeSource(target.cell.source)),
+          stableHash(target.cell.metadata || {}),
+          (target.cell.outputs || []).length
+        ].join(":");
+        const expectedToken = textValue(request.readToken || request.expectedReadToken || request.ifMatchReadToken);
+        if (expectedToken && expectedToken !== actualToken) {
+          throw structuredError("CELL_STALE_READ", `Cell ${target.index} changed since it was last read`, {
+            index: target.index,
+            cellId: target.cell.id || target.cell.metadata?.id || null,
+            expectedReadToken: expectedToken,
+            actualReadToken: actualToken
+          });
+        }
+      }
+      const nextState = cloneNotebookCellState(target.cell);
+      if (request.kind !== undefined) {
+        nextState.kind = notebookKind(request.kind) === vscode.NotebookCellKind.Markup ? "markdown" : "code";
+      }
+      if (request.source !== undefined) {
+        nextState.source = normalizeSource(request.source);
+      }
+      if (request.metadata !== undefined) {
+        nextState.metadata = cloneNotebookValue(request.metadata || {});
+        nextState.id = nextState.metadata.id || nextState.id || null;
+      }
+      if (request.languageId !== undefined) {
+        nextState.languageId = textValue(request.languageId, nextState.languageId);
+      } else if (request.kind !== undefined && !request.languageId) {
+        nextState.languageId = notebookLanguage(nextState.kind);
+      }
+      states[target.index] = nextState;
+      batchState.mutated = true;
+      return {
+        operation: "cell.update",
+        applied: true,
+        identityStable: true,
+        cell: summarizedStateCell(nextState, target.index),
+        summary: `Updated cell ${target.index}`
+      };
+    }
+    case "delete": {
+      const indexes = resolveDeleteIndexesFromState(states, request, batchState.selectionIndex);
+      for (let i = indexes.length - 1; i >= 0; i -= 1) {
+        states.splice(indexes[i], 1);
+      }
+      batchState.selectionIndex = adjustSelectionAfterDelete(batchState.selectionIndex, indexes, states.length);
+      batchState.mutated = true;
+      return {
+        operation: "cell.delete",
+        applied: true,
+        identityStable: true,
+        result: { deletedIndexes: indexes },
+        summary: `Deleted ${indexes.length} cell(s)`
+      };
+    }
+    case "move": {
+      const target = findStateCell(states, request, { selectionIndex: batchState.selectionIndex });
+      const destinationIndex =
+        request.toIndex !== undefined
+          ? toInteger(request.toIndex)
+          : request.direction === "up"
+            ? target.index - 1
+            : request.direction === "down"
+              ? target.index + 1
+              : null;
+      if (destinationIndex === null || destinationIndex < 0 || destinationIndex >= states.length) {
+        throw structuredError("CELL_INDEX_OUT_OF_RANGE", `Destination index out of range: ${destinationIndex}`);
+      }
+      const [moved] = states.splice(target.index, 1);
+      states.splice(destinationIndex, 0, moved);
+      if (batchState.selectionIndex === target.index) {
+        batchState.selectionIndex = destinationIndex;
+      }
+      batchState.mutated = true;
+      return {
+        operation: "cell.move",
+        applied: true,
+        identityStable: true,
+        result: { from: target.index, to: destinationIndex },
+        summary: `Moved cell ${target.index} to ${destinationIndex}`
+      };
+    }
+    case "duplicate": {
+      const target = findStateCell(states, request, { selectionIndex: batchState.selectionIndex });
+      const insertIndex = toInteger(request.toIndex, target.index + 1);
+      if (insertIndex < 0 || insertIndex > states.length) {
+        throw structuredError("CELL_INDEX_OUT_OF_RANGE", `Cell index out of range: ${insertIndex}`);
+      }
+      const duplicate = cloneNotebookCellState(target.cell);
+      states.splice(insertIndex, 0, duplicate);
+      batchState.mutated = true;
+      return {
+        operation: "cell.duplicate",
+        applied: true,
+        identityStable: true,
+        cell: summarizedStateCell(duplicate, insertIndex),
+        summary: `Duplicated cell ${target.index} to ${insertIndex}`
+      };
+    }
+    case "select": {
+      const target = findStateCell(states, request, { selectionIndex: batchState.selectionIndex });
+      batchState.selectionIndex = target.index;
+      batchState.uiAction = { kind: "select", index: target.index };
+      return {
+        operation: "cell.select",
+        applied: true,
+        identityStable: true,
+        cell: summarizedStateCell(target.cell, target.index),
+        selection: [{ start: target.index, end: target.index + 1 }],
+        summary: `Selected cell ${target.index}`
+      };
+    }
+    case "reveal": {
+      const target = findStateCell(states, request, { selectionIndex: batchState.selectionIndex });
+      batchState.uiAction = { kind: "reveal", index: target.index };
+      return {
+        operation: "cell.reveal",
+        applied: true,
+        identityStable: true,
+        cell: summarizedStateCell(target.cell, target.index),
+        summary: `Revealed cell ${target.index}`
+      };
+    }
+    case "replaceOutputs": {
+      const target = findStateCell(states, request, { selectionIndex: batchState.selectionIndex });
+      target.cell.outputs = buildOutputs(request.outputs || []);
+      batchState.mutated = true;
+      return {
+        operation: "cell.replaceOutputs",
+        applied: true,
+        identityStable: true,
+        cell: summarizedStateCell(target.cell, target.index),
+        summary: `Replaced outputs for cell ${target.index}`
+      };
+    }
+    case "clearOutputs": {
+      if (toBoolean(request.all, false)) {
+        for (const state of states) {
+          state.outputs = [];
+        }
+        batchState.mutated = true;
+        return {
+          operation: "cell.clearOutputs",
+          applied: true,
+          identityStable: true,
+          result: { all: true },
+          summary: "Cleared outputs for all cells"
+        };
+      }
+      const target = findStateCell(states, request, { selectionIndex: batchState.selectionIndex });
+      target.cell.outputs = [];
+      batchState.mutated = true;
+      return {
+        operation: "cell.clearOutputs",
+        applied: true,
+        identityStable: true,
+        cell: summarizedStateCell(target.cell, target.index),
+        summary: `Cleared outputs for cell ${target.index}`
+      };
+    }
+    default:
+      throw structuredError("BATCH_OPERATION_NOT_SUPPORTED", `Unsupported batch operation: ${kind}`);
+  }
+}
+
+async function batchCells(payload) {
   const operations = arrayValue(payload.operations || payload.ops);
   if (operations.length === 0) {
     throw structuredError("BATCH_OPERATIONS_REQUIRED", "Batch operations are required");
   }
 
+  const editor = getEditorOrThrow();
+  const mode = normalizeBatchMode(payload.mode);
+  const verboseResults = toBoolean(payload.verboseResults, false);
+  const states = getNotebookCells(editor).map((cell) => notebookCellStateFromCell(cell));
+  const batchState = {
+    selectionIndex: batchSelectionIndex(editor),
+    mutated: false,
+    uiAction: null
+  };
   const results = [];
-  for (const operation of operations) {
-    const kind = textValue(operation.op || operation.action);
-    const request = { ...operation, noFollow: operation.noFollow !== undefined ? operation.noFollow : true };
-    switch (kind) {
-      case "insert":
-        results.push(await insertCell(request, false));
-        break;
-      case "append":
-        results.push(await insertCell(request, true));
-        break;
-      case "update":
-        results.push(await updateCell(request));
-        break;
-      case "delete":
-        results.push(await deleteCells(request));
-        break;
-      case "move":
-        results.push(await moveCell(request));
-        break;
-      case "duplicate":
-        results.push(await duplicateCell(request));
-        break;
-      case "select":
-        results.push(await selectTargetCell(request, false));
-        break;
-      case "reveal":
-        results.push(await selectTargetCell(request, true));
-        break;
-      case "replaceOutputs":
-        results.push(await replaceOutputs(request));
-        break;
-      case "clearOutputs":
-        results.push(await clearOutputs(request));
-        break;
-      default:
-        throw structuredError("BATCH_OPERATION_NOT_SUPPORTED", `Unsupported batch operation: ${kind}`);
+  const errors = [];
+
+  for (let i = 0; i < operations.length; i += 1) {
+    const operation = operations[i];
+    try {
+      const result = applyBatchOperationToState(states, operation, batchState);
+      results.push(verboseResults ? result : compactBatchResult(result));
+    } catch (error) {
+      const payloadError = serializeError(error);
+      errors.push({
+        at: i,
+        op: textValue(operation.op || operation.action),
+        error: payloadError.error
+      });
+      if (mode === "transactional") {
+        throw structuredError("BATCH_TRANSACTION_ABORTED", `Batch aborted at operation ${i}`, {
+          mode,
+          failedAt: i,
+          errors
+        });
+      }
     }
   }
 
+  if (batchState.mutated) {
+    await applyNotebookCellReplacement(editor, 0, editor.notebook.cellCount, states.map((state) => notebookCellDataFromState(state)));
+  }
+  if (batchState.uiAction && states.length > 0) {
+    const updatedEditor = getEditorOrThrow();
+    if (batchState.uiAction.kind === "select") {
+      await selectCell(updatedEditor, batchState.uiAction.index, {
+        reveal: toBoolean(payload.followFinal, false)
+      });
+    } else if (batchState.uiAction.kind === "reveal") {
+      await revealCellSmoothly(updatedEditor, batchState.uiAction.index, { forceReveal: true });
+    }
+  }
+
+  bridgeState.lastMutation = {
+    operation: "cell.batch",
+    at: new Date().toISOString(),
+    notebookUri: notebookUri(editor),
+    target: {
+      count: operations.length,
+      completedCount: results.length
+    },
+    source: "bridge",
+    lastMutationApplied: batchState.mutated,
+    lastMutationObservedAt: new Date().toISOString()
+  };
+
   return okResponse("cell.batch", {
     result: {
-      count: operations.length
+      count: operations.length,
+      completedCount: results.length,
+      failedAt: errors.length > 0 ? errors[0].at : null,
+      mode,
+      partial: mode === "bestEffort" && errors.length > 0
     },
+    errors,
     results,
-    summary: `Applied ${operations.length} batch cell operation(s)`
+    summary: `Applied ${results.length}/${operations.length} batch cell operation(s)`
   }, { includeState: false });
 }
 
@@ -2103,7 +2579,7 @@ async function runNotebookCommandWithLocator(operation, commandId, payload, opti
       identityStable: true,
       selection: activeNotebookInfo(editor).selection,
       summary: `Execution requested with ${commandId}`
-    });
+    }, { includeState: false });
   }
   return withCellSelection(
     editor,
@@ -2122,7 +2598,7 @@ async function runNotebookCommandWithLocator(operation, commandId, payload, opti
         identityStable: true,
         selection: activeNotebookInfo(editor).selection,
         summary: `Execution requested for cell ${target.index}`
-      });
+      }, { includeState: false });
     },
     { restoreSelection: toBoolean(payload.restoreSelection, false) }
   );
@@ -2135,7 +2611,7 @@ async function debugNotebookCommand(operation, commandId, payload = {}, options 
     return okResponse(operation, {
       debug: debugState(editor),
       summary: `Debug command executed: ${commandId}`
-    });
+    }, { includeState: false });
   }
   return withCellSelection(
     editor,
@@ -2149,7 +2625,7 @@ async function debugNotebookCommand(operation, commandId, payload = {}, options 
         cell: serializeCell(target.cell, target.index),
         debug: debugState(editor),
         summary: `Debug command executed for cell ${target.index}`
-      });
+      }, { includeState: false });
     },
     { restoreSelection: toBoolean(payload.restoreSelection, false) }
   );
@@ -2163,7 +2639,7 @@ async function kernelCommand(operation, commandId, payload = {}, options = {}) {
   return okResponse(operation, {
     result: { command: commandId },
     summary: `Kernel command executed: ${commandId}`
-  });
+  }, { includeState: false });
 }
 
 async function notebookCommand(operation, commandId) {
@@ -2178,7 +2654,7 @@ async function notebookCommand(operation, commandId) {
     await vscode.window.showNotebookDocument(editor.notebook, { preserveFocus: false, preview: false });
     bridgeState.lastNotebookAction = { command: "focus", at: new Date().toISOString() };
   }
-  return okResponse(operation, { summary: `Notebook command executed: ${commandId}` });
+  return okResponse(operation, { summary: `Notebook command executed: ${commandId}` }, { includeState: false });
 }
 
 async function kernelShutdown() {
@@ -2253,16 +2729,21 @@ function normalizeObserveMode(value) {
 }
 
 function compactMutationResult(response) {
+  const cell = compactCellSummary(response.cell);
   return {
     operation: response.operation || null,
     applied: response.applied === true,
     identityStable: response.identityStable !== false,
-    cell: response.cell || null,
+    cell: cell,
+    index: cell ? cell.index : null,
+    cellId: cell ? cell.id : null,
+    result: response.result || null,
     summary: response.summary || null
   };
 }
 
 function compactExecutionResult(response, observe = "completion") {
+  const cell = compactCellSummary(response.cell);
   return {
     operation: response.operation || null,
     accepted: response.accepted === true,
@@ -2270,8 +2751,9 @@ function compactExecutionResult(response, observe = "completion") {
     completionObserved: observe === "none" ? null : response.completionObserved === true,
     outputObserved: observe === "outputSummary" ? response.outputObserved === true : null,
     identityStable: response.identityStable !== false,
-    selection: response.selection || [],
-    cell: response.cell || null,
+    index: cell ? cell.index : null,
+    cellId: cell ? cell.id : null,
+    cell: cell,
     summary: response.summary || null
   };
 }
@@ -2374,8 +2856,8 @@ async function httpGet(url) {
       const active = getEditorOrThrow();
       return okResponse("cells", {
         cells: getNotebookCells(active).map((cell, index) => serializeCell(cell, index, {
-          includeSource: toBoolean(url.searchParams.get("includeSource"), true),
-          includeMetadata: toBoolean(url.searchParams.get("includeMetadata"), true),
+          includeSource: toBoolean(url.searchParams.get("includeSource"), false),
+          includeMetadata: toBoolean(url.searchParams.get("includeMetadata"), false),
           includeOutputs: toBoolean(url.searchParams.get("includeOutputs"), false)
         }))
       });
@@ -2388,9 +2870,9 @@ async function httpGet(url) {
         marker: url.searchParams.get("marker"),
         selection: url.searchParams.get("selection")
       }, {
-        includeSource: toBoolean(url.searchParams.get("includeSource"), true),
-        includeMetadata: toBoolean(url.searchParams.get("includeMetadata"), true),
-        includeOutputs: toBoolean(url.searchParams.get("includeOutputs"), true)
+        includeSource: toBoolean(url.searchParams.get("includeSource"), false),
+        includeMetadata: toBoolean(url.searchParams.get("includeMetadata"), false),
+        includeOutputs: toBoolean(url.searchParams.get("includeOutputs"), false)
       });
     case "/context": {
       const active = getEditorOrThrow();
@@ -2402,8 +2884,8 @@ async function httpGet(url) {
           execution: executionState(active),
           compliance: complianceState(active),
           cells: getNotebookCells(active).map((cell, index) => serializeCell(cell, index, {
-            includeSource: toBoolean(url.searchParams.get("includeSource"), true),
-            includeMetadata: toBoolean(url.searchParams.get("includeMetadata"), true),
+            includeSource: toBoolean(url.searchParams.get("includeSource"), false),
+            includeMetadata: toBoolean(url.searchParams.get("includeMetadata"), false),
             includeOutputs: toBoolean(url.searchParams.get("includeOutputs"), false),
             outputTextLimit: 300
           }))
@@ -2501,7 +2983,7 @@ async function httpPost(url, body) {
         outputObserved: false,
         identityStable: true,
         summary: "Execution requested for entire notebook"
-      });
+      }, { includeState: false });
     case "/run/selectedAndAdvance":
       return runNotebookCommandWithLocator("run.selectedAndAdvance", "notebook.cell.executeAndSelectBelow", body, {
         useCurrentSelection: toBoolean(body.useCurrentSelection, false)
@@ -2514,13 +2996,13 @@ async function httpPost(url, body) {
       return debugNotebookCommand("debug.cell", "jupyter.debugcell", body);
     case "/debug/continue":
       await executeCommand("jupyter.debugcontinue", [], { kind: "debug" });
-      return okResponse("debug.continue", { debug: debugState(), summary: "Debug continue requested" });
+      return okResponse("debug.continue", { debug: debugState(), summary: "Debug continue requested" }, { includeState: false });
     case "/debug/stepOver":
       await executeCommand("jupyter.debugstepover", [], { kind: "debug" });
-      return okResponse("debug.stepOver", { debug: debugState(), summary: "Debug step-over requested" });
+      return okResponse("debug.stepOver", { debug: debugState(), summary: "Debug step-over requested" }, { includeState: false });
     case "/debug/stop":
       await executeCommand("jupyter.debugstop", [], { kind: "debug" });
-      return okResponse("debug.stop", { debug: debugState(), summary: "Debug stop requested" });
+      return okResponse("debug.stop", { debug: debugState(), summary: "Debug stop requested" }, { includeState: false });
     case "/kernel/interrupt":
       return kernelCommand("kernel.interrupt", "jupyter.interruptkernel", body);
     case "/kernel/restart":
@@ -2533,7 +3015,7 @@ async function httpPost(url, body) {
       return kernelShutdown();
     case "/kernel/select":
       await executeCommand("notebook.selectKernel", [], { kind: "kernel" });
-      return okResponse("kernel.select", { summary: "Kernel picker opened" });
+      return okResponse("kernel.select", { summary: "Kernel picker opened" }, { includeState: false });
     case "/notebook/save":
       return notebookCommand("notebook.save", "save");
     case "/notebook/revert":
@@ -2544,16 +3026,16 @@ async function httpPost(url, body) {
       return notebookCommand("notebook.focus", "focus");
     case "/viewer/variables/open":
       await executeCommand("jupyter.openVariableView", [], { kind: "notebook" });
-      return okResponse("viewer.variables.open", { summary: "Variable view opened" });
+      return okResponse("viewer.variables.open", { summary: "Variable view opened" }, { includeState: false });
     case "/viewer/data/open":
       await executeCommand("jupyter.showDataViewer", [], { kind: "notebook" });
-      return okResponse("viewer.data.open", { summary: "Data Viewer command invoked" });
+      return okResponse("viewer.data.open", { summary: "Data Viewer command invoked" }, { includeState: false });
     case "/viewer/output/open":
       await executeCommand("jupyter.viewOutput", [], { kind: "notebook" });
-      return okResponse("viewer.output.open", { summary: "Jupyter output panel opened" });
+      return okResponse("viewer.output.open", { summary: "Jupyter output panel opened" }, { includeState: false });
     case "/interpreter/select":
       await executeCommand("jupyter.selectJupyterInterpreter", [], { kind: "notebook" });
-      return okResponse("interpreter.select", { summary: "Interpreter picker opened" });
+      return okResponse("interpreter.select", { summary: "Interpreter picker opened" }, { includeState: false });
     default:
       throw structuredError("NOT_FOUND", `Unknown POST route: ${url.pathname}`);
   }

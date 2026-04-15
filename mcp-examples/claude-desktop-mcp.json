@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "jupyter-bridge": {
+      "command": "D:\\sky\\jupyter-bridge-notebook-project\\jupyterbridge-mcp.exe",
+      "args": [
+        "-cwd",
+        "D:\\sky"
+      ]
+    }
+  }
+}

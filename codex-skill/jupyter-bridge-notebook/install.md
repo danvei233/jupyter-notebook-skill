@@ -7,7 +7,7 @@ This skill depends on the VS Code extension `local.vscode-data-bridge`.
 Read this file when:
 
 - bridge calls fail
-- `GET /status` is unavailable
+- `GET /status/brief` is unavailable
 - notebook bridge commands are missing
 - the skill is being migrated to another machine
 
@@ -23,8 +23,18 @@ Read this file when:
    - run `scripts/bridgectl.exe -install-extension ..\\assets\\vscode-data-bridge\\vscode-data-bridge-0.0.1.vsix`
 5. After install:
    - ask the user to run `Developer: Reload Window`
-   - then verify with `GET /status`
+   - then verify with `GET /status/brief`
    - then verify with `GET /compliance`
+
+## MCP-First Verification
+
+When the client supports MCP, verify the bridge in this order:
+
+1. `bridge_get_status_brief`
+2. `bridge_get_compliance`
+3. `bridge_get_active_server`
+
+Use `scripts/bridgectl.exe` only when MCP is not yet configured or when low-level troubleshooting is needed.
 
 ## Bundled Migration Assets
 
@@ -36,6 +46,7 @@ The skill includes a portable copy of the bridge extension under `assets/vscode-
 - `README.md`
 
 The skill includes `scripts/bridgectl.exe` as the preferred local bridge client and extension installer.
+The skill also includes `scripts/jupyterbridge-mcp.exe` as the preferred bundled stdio MCP server for clients that need a local MCP executable.
 
 Use these bundled files as the preferred migration source instead of relying on an external path.
 

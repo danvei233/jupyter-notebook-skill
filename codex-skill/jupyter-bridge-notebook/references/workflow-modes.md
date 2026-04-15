@@ -29,9 +29,11 @@ This is smart streaming, not mechanical over-checking.
 2. Run setup/import cells before later stages depend on them.
 3. Add one analytical block at a time, usually 2-4 related cells per stage.
 4. Run only the new block or directly dependent cells.
-5. Default to `GET /status/brief`, `/workflow/*`, and `/output/summary` for normal stages.
+5. Default to `bridge_get_status_brief`, `bridge_post_workflow_*`, and `bridge_get_output_summary` for normal stages.
 6. Escalate to full `/status` + `/compliance` + `/context` only for high-risk steps.
 7. Add or revise conclusions after outputs exist.
+8. Skip README, skill reference, extension source, command catalog, and capability reads unless bridge behavior is unclear.
+9. Do not pre-run the same notebook analysis in shell-side `python` / `py` if the notebook kernel is already available.
 
 ### Avoid
 
@@ -53,7 +55,7 @@ Use this only when the user explicitly wants Codex's native freeform approach.
 
 - keep bridge-first mutation/execution rules
 - keep notebook identity/state checks
-- prefer light checks such as `/status/brief` unless risk is high
+- prefer light checks such as `bridge_get_status_brief` unless risk is high
 - otherwise allow normal judgment about writing order, structure, and execution order
 
 ### Still avoid

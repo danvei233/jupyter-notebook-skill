@@ -3,6 +3,7 @@
 Local VS Code extension that exposes notebook and data-analysis commands through:
 
 - the Command Palette
+- a dedicated Data Bridge control center sidebar
 - a local HTTP bridge on a configurable host and port
 
 Defaults:
@@ -39,6 +40,38 @@ The bridge also tracks notebook runtime signals from VS Code notebook events so 
 
 These signals are surfaced through `GET /status`, `GET /context`, `GET /execution/state`, and `GET /kernel/state`.
 
+Bridge-first compliance is surfaced through `GET /compliance`, and common mutation-plus-execution flows are available as:
+
+- `POST /workflow/updateAndRun`
+- `POST /workflow/insertAndRun`
+
+Lightweight routes are also available for faster clients:
+
+- `GET /status/brief`
+- `GET /output/summary`
+- `POST /cell/batch`
+
+The workflow endpoints accept lighter observation controls:
+
+- `observe`: `none | completion | outputSummary`
+- `includeOutput`: default `false`
+
+`POST /kernel/shutdown` is intentionally declared but currently unsupported.
+
+## Control Center Sidebar
+
+The extension contributes a `Data Bridge` sidebar with a `Control Center` view. It shows:
+
+- the current focused notebook
+- the bound bridge server and base URL
+- the local bridge server list across the configured port span
+- kernel busy/idle and bridge compliance state
+- editable settings for auto-start, scroll follow, host, port, port span, token, and command safety
+- Chinese UI labels when VS Code is running in Chinese
+- lightweight auto-refresh only while the control center is visible
+
+If you prefer the secondary sidebar on the right, move the `Data Bridge` view container there in VS Code after reload.
+
 ## Install For Development
 
 1. Open this folder as a VS Code extension project.
@@ -47,13 +80,43 @@ These signals are surfaced through `GET /status`, `GET /context`, `GET /executio
 
 ## HTTP API
 
+The repository truth source for route status and MCP tool mapping is:
+
+```text
+..\internal\bridgecatalog\capabilities.json
+```
+
 ### `GET /status`
 
 Returns bridge status and active notebook metadata.
 
+### `GET /status/brief`
+
+Returns lightweight notebook identity, server, and busy/idle state.
+
+### `GET /servers`
+
+Returns the local bridge server list discovered across the configured host and port span.
+
 ### `GET /commands`
 
 Returns the built-in quick command list.
+
+Diagnostic only. Do not use this as a normal notebook-task preflight.
+
+### `GET /capabilities`
+
+Returns bridge capability metadata.
+
+Diagnostic only. MCP clients should normally rely on the registered tool surface and descriptions instead of probing capabilities before routine notebook work.
+
+### `GET /output/summary`
+
+Returns lightweight output summary for a target cell.
+
+### `POST /cell/batch`
+
+Applies several cell mutations in one request.
 
 ### `POST /execute`
 
@@ -66,16 +129,12 @@ Example body:
 }
 ```
 
-PowerShell example:
+Recommended local client:
 
-```powershell
-$baseUrl = if ($env:DATA_BRIDGE_BASE_URL) { $env:DATA_BRIDGE_BASE_URL } else { 'http://127.0.0.1:8765' }
-Invoke-RestMethod -Method Post -Uri "$baseUrl/execute" -ContentType 'application/json' -Body '{"command":"jupyter.runcell","args":[]}'
+```cmd
+bridgectl.exe -method POST -path /execute -body "{\"command\":\"jupyter.runcell\",\"args\":[]}"
 ```
 
-If `dataBridge.token` is set, send:
+If `dataBridge.token` is set, pass `-token YOUR_TOKEN` to `bridgectl.exe`.
 
-```powershell
-$baseUrl = if ($env:DATA_BRIDGE_BASE_URL) { $env:DATA_BRIDGE_BASE_URL } else { 'http://127.0.0.1:8765' }
-Invoke-RestMethod -Method Post -Uri "$baseUrl/execute" -Headers @{ Authorization = 'Bearer YOUR_TOKEN' } -ContentType 'application/json' -Body '{"command":"jupyter.runcell","args":[]}'
-```
+The recommended high-level client is the stdio MCP server `jupyterbridge-mcp.exe`; use `bridgectl.exe` for low-level diagnostics, installs, and direct HTTP troubleshooting.

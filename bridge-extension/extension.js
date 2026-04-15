@@ -32,8 +32,11 @@ const QUICK_COMMANDS = [
 
 const DEFAULT_ENDPOINTS = [
   "GET /status",
+  "GET /status/brief",
+  "GET /servers",
   "GET /commands",
   "GET /capabilities",
+  "GET /compliance",
   "GET /notebook",
   "GET /notebook/dirty",
   "GET /cells",
@@ -42,11 +45,13 @@ const DEFAULT_ENDPOINTS = [
   "GET /kernel",
   "GET /kernel/state",
   "GET /output",
+  "GET /output/summary",
   "GET /execution/state",
   "GET /debug/state",
   "POST /execute",
   "POST /executeCellByIndex",
   "POST /cell/read",
+  "POST /cell/batch",
   "POST /cell/insert",
   "POST /cell/append",
   "POST /cell/update",
@@ -57,6 +62,8 @@ const DEFAULT_ENDPOINTS = [
   "POST /cell/reveal",
   "POST /cell/replaceOutputs",
   "POST /cell/clearOutputs",
+  "POST /workflow/updateAndRun",
+  "POST /workflow/insertAndRun",
   "POST /run/current",
   "POST /run/cell",
   "POST /run/above",
@@ -93,38 +100,79 @@ const bridgeState = {
   lastNotebookAction: null,
   lastMutation: null,
   lastError: null,
+  server: {
+    host: null,
+    port: null,
+    basePort: null,
+    portSpan: null,
+    startedAt: null
+  },
   notebookRuntime: {},
   activeNotebook: {
     uri: null,
     switchedAt: null,
     switchCount: 0,
-    visibleEditors: 0
+    visibleEditors: 0,
+    selectionSnapshot: [],
+    versionToken: null
+  },
+  sidebar: {
+    lastUpdatedAt: null,
+    servers: [],
+    refreshing: false
   }
 };
 
 let bridgeServer;
 let output;
+let controlCenterProvider;
+let followAnimationSequence = 0;
 
 function activate(context) {
   output = vscode.window.createOutputChannel("Data Bridge");
   context.subscriptions.push(output);
 
+  controlCenterProvider = new DataBridgeControlCenterProvider(context.extensionUri);
+
   context.subscriptions.push(
     vscode.window.onDidChangeActiveNotebookEditor((editor) => {
       updateActiveNotebookIdentity(editor, "active-editor-changed");
+      refreshControlCenterSoon();
     }),
     vscode.window.onDidChangeVisibleNotebookEditors((editors) => {
       bridgeState.activeNotebook.visibleEditors = editors.length;
+      refreshControlCenterSoon();
+    }),
+    vscode.window.onDidChangeNotebookEditorSelection((event) => {
+      updateSelectionObservation(event.notebookEditor, "selection-changed");
+      refreshControlCenterSoon();
     }),
     vscode.workspace.onDidChangeNotebookDocument((event) => {
       updateNotebookRuntimeFromEvent(event);
-    })
+      refreshControlCenterSoon();
+    }),
+    vscode.workspace.onDidChangeConfiguration(async (event) => {
+      if (event.affectsConfiguration("dataBridge")) {
+        try {
+          await handleConfigurationChange(event);
+        } catch (error) {
+          log(`Configuration update failed: ${error.stack || error.message}`);
+        } finally {
+          refreshControlCenterSoon();
+        }
+      }
+    }),
+    vscode.window.registerWebviewViewProvider("dataBridge.controlCenter", controlCenterProvider)
   );
 
   updateActiveNotebookIdentity(vscode.window.activeNotebookEditor || null, "activate");
   bridgeState.activeNotebook.visibleEditors = vscode.window.visibleNotebookEditors.length;
 
   context.subscriptions.push(
+    vscode.commands.registerCommand("dataBridge.openControlCenter", async () => openControlCenter()),
+    vscode.commands.registerCommand("dataBridge.refreshControlCenter", async () => {
+      await refreshControlCenter();
+    }),
     vscode.commands.registerCommand("dataBridge.startServer", async () => startServer()),
     vscode.commands.registerCommand("dataBridge.stopServer", async () => stopServer()),
     vscode.commands.registerCommand("dataBridge.showStatus", async () => showStatus()),
@@ -137,6 +185,8 @@ function activate(context) {
   if (getConfig().get("autoStart", true)) {
     startServer().catch((error) => log(`Auto-start failed: ${error.stack || error.message}`));
   }
+
+  refreshControlCenterSoon();
 }
 
 function deactivate() {
@@ -151,10 +201,12 @@ function getServerConfig() {
   const config = getConfig();
   const envHost = process.env.DATA_BRIDGE_HOST || process.env.VSCODE_DATA_BRIDGE_HOST;
   const envPort = process.env.DATA_BRIDGE_PORT || process.env.VSCODE_DATA_BRIDGE_PORT;
+  const envPortSpan = process.env.DATA_BRIDGE_PORT_SPAN || process.env.VSCODE_DATA_BRIDGE_PORT_SPAN;
   const envToken = process.env.DATA_BRIDGE_TOKEN || process.env.VSCODE_DATA_BRIDGE_TOKEN;
   return {
     host: envHost || config.get("host", "127.0.0.1"),
     port: toInteger(envPort, config.get("port", 8765)),
+    portSpan: toInteger(envPortSpan, config.get("portSpan", 20)),
     token: envToken !== undefined ? envToken : config.get("token", ""),
     allowArbitraryCommands: config.get("allowArbitraryCommands", false),
     allowedPrefixes: config.get("allowedCommandPrefixes", [])
@@ -163,6 +215,646 @@ function getServerConfig() {
 
 function log(message) {
   output.appendLine(`[${new Date().toLocaleTimeString()}] ${message}`);
+}
+
+function nonce() {
+  return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function shortPathLabel(value) {
+  if (!value) {
+    return "None";
+  }
+  const normalized = String(value).replace(/^file:\/\/\/?/i, "");
+  const parts = normalized.split(/[\\/]/).filter(Boolean);
+  return parts.length <= 2 ? normalized : parts.slice(-2).join("/");
+}
+
+function maskToken(token) {
+  if (!token) {
+    return "Not set";
+  }
+  if (token.length <= 6) {
+    return `${token.slice(0, 1)}***`;
+  }
+  return `${token.slice(0, 3)}***${token.slice(-2)}`;
+}
+
+const I18N = {
+  en: {
+    none: "None",
+    notSet: "Not set",
+    unavailable: "Unavailable",
+    current: "Current",
+    other: "Other",
+    busy: "busy",
+    idle: "idle",
+    ready: "ready",
+    offline: "offline",
+    controlCenterTitle: "Control Center",
+    currentFocus: "Current focus",
+    notebookUri: "Notebook URI",
+    selection: "Selection",
+    visibleRange: "Visible range",
+    server: "Server",
+    kernelBusy: "Kernel busy",
+    bridgeCompliance: "Bridge compliance",
+    refresh: "Refresh",
+    copyConfig: "Copy Config",
+    showStatus: "Show Status",
+    stopServer: "Stop Server",
+    startServer: "Start Server",
+    servers: "Servers",
+    localBridgeScan: "Local bridge scan across {start}-{end}.",
+    role: "Role",
+    baseUrl: "Base URL",
+    notebook: "Notebook",
+    workspace: "Workspace",
+    noServers: "No bridge servers found.",
+    settings: "Settings",
+    autoStart: "Auto start server",
+    followTargetCell: "Scroll follow current bridge target",
+    allowArbitraryCommands: "Allow arbitrary commands",
+    autoRefresh: "Auto refresh when visible",
+    host: "Host",
+    basePort: "Base port",
+    portSpan: "Port span",
+    refreshInterval: "Refresh interval (ms)",
+    token: "Token",
+    openFullSettings: "Open Full Settings",
+    reloadView: "Reload View",
+    safety: "Safety",
+    fallbackAllowed: "Fallback allowed",
+    mutationRequired: "Mutation required",
+    executionRequired: "Execution required",
+    identityStable: "Identity stable",
+    yes: "yes",
+    no: "no",
+    bridgeRequired: "bridge",
+    optional: "optional",
+    visibleOnlyNote: "Auto refresh only runs while this view is visible."
+  },
+  zh: {
+    none: "无",
+    notSet: "未设置",
+    unavailable: "不可用",
+    current: "当前",
+    other: "其他",
+    busy: "忙碌",
+    idle: "空闲",
+    ready: "就绪",
+    offline: "离线",
+    controlCenterTitle: "控制中心",
+    currentFocus: "当前焦点",
+    notebookUri: "笔记本 URI",
+    selection: "当前选区",
+    visibleRange: "可视范围",
+    server: "当前服务器",
+    kernelBusy: "内核状态",
+    bridgeCompliance: "Bridge 合规状态",
+    refresh: "刷新",
+    copyConfig: "复制配置",
+    showStatus: "显示状态",
+    stopServer: "停止服务",
+    startServer: "启动服务",
+    servers: "服务器列表",
+    localBridgeScan: "本地 Bridge 扫描范围：{start}-{end}",
+    role: "角色",
+    baseUrl: "地址",
+    notebook: "笔记本",
+    workspace: "工作区",
+    noServers: "未发现 Bridge 服务器。",
+    settings: "配置项",
+    autoStart: "自动启动服务",
+    followTargetCell: "滚动跟随当前 Bridge 目标",
+    allowArbitraryCommands: "允许任意命令",
+    autoRefresh: "视图可见时自动刷新",
+    host: "主机",
+    basePort: "基础端口",
+    portSpan: "端口跨度",
+    refreshInterval: "刷新间隔（毫秒）",
+    token: "令牌",
+    openFullSettings: "打开完整设置",
+    reloadView: "重载视图",
+    safety: "安全",
+    fallbackAllowed: "是否允许降级",
+    mutationRequired: "修改要求",
+    executionRequired: "执行要求",
+    identityStable: "身份稳定",
+    yes: "是",
+    no: "否",
+    bridgeRequired: "必须走 bridge",
+    optional: "可选",
+    visibleOnlyNote: "自动刷新只会在当前视图可见时运行。"
+  }
+};
+
+function localeBundle() {
+  const language = String(vscode.env.language || "en").toLowerCase();
+  return language.startsWith("zh") ? I18N.zh : I18N.en;
+}
+
+function t(key, replacements = {}) {
+  const bundle = localeBundle();
+  const template = bundle[key] || I18N.en[key] || key;
+  return Object.entries(replacements).reduce((result, [name, value]) => result.replaceAll(`{${name}}`, String(value)), template);
+}
+
+function controlCenterIntervalMs() {
+  const value = toInteger(getConfig().get("controlCenterRefreshIntervalMs", 3000), 3000);
+  return Math.min(Math.max(value, 1000), 30000);
+}
+
+function configurationTarget() {
+  return vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0
+    ? vscode.ConfigurationTarget.Workspace
+    : vscode.ConfigurationTarget.Global;
+}
+
+function shouldFollowTargetCell(forceReveal = false) {
+  return forceReveal || getConfig().get("followTargetCell", true);
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function easeOutCubic(t) {
+  return 1 - Math.pow(1 - t, 3);
+}
+
+function currentVisibleAnchor(editor) {
+  if (editor && Array.isArray(editor.visibleRanges) && editor.visibleRanges.length > 0) {
+    const first = editor.visibleRanges[0];
+    const last = editor.visibleRanges[editor.visibleRanges.length - 1];
+    return Math.round((first.start + last.end - 1) / 2);
+  }
+  if (editor && Array.isArray(editor.selections) && editor.selections.length > 0) {
+    return editor.selections[0].start;
+  }
+  return 0;
+}
+
+async function revealCellSmoothly(editor, index, options = {}) {
+  if (!editor) {
+    return;
+  }
+  const targetRange = new vscode.NotebookRange(index, index + 1);
+  const startIndex = currentVisibleAnchor(editor);
+  const distance = Math.abs(index - startIndex);
+  if (distance <= 2 || options.immediate) {
+    editor.revealRange(targetRange);
+    return;
+  }
+
+  const animationId = ++followAnimationSequence;
+  const steps = Math.min(7, Math.max(3, Math.ceil(distance / 6)));
+  const frameDelay = Math.min(36, Math.max(18, Math.round((options.durationMs || 180) / steps)));
+  let lastIndex = startIndex;
+
+  for (let step = 1; step <= steps; step += 1) {
+    if (animationId !== followAnimationSequence) {
+      return;
+    }
+    const progress = easeOutCubic(step / steps);
+    const nextIndex = Math.round(startIndex + (index - startIndex) * progress);
+    if (nextIndex !== lastIndex || step === steps) {
+      editor.revealRange(new vscode.NotebookRange(nextIndex, nextIndex + 1));
+      lastIndex = nextIndex;
+    }
+    if (step < steps) {
+      await sleep(frameDelay);
+    }
+  }
+}
+
+async function updateBridgeSetting(key, value) {
+  await getConfig().update(key, value, configurationTarget());
+}
+
+function currentServerBaseUrl() {
+  const host = bridgeState.server.host || getServerConfig().host;
+  const port = bridgeState.server.port || getServerConfig().port;
+  return `http://${host}:${port}`;
+}
+
+function requestJson(baseUrl, pathname, token) {
+  return new Promise((resolve, reject) => {
+    const url = new URL(pathname, `${baseUrl}/`);
+    const request = http.request(
+      url,
+      {
+        method: "GET",
+        headers: token ? { Authorization: `Bearer ${token}` } : {}
+      },
+      (response) => {
+        let raw = "";
+        response.on("data", (chunk) => {
+          raw += chunk;
+        });
+        response.on("end", () => {
+          if (response.statusCode && response.statusCode >= 400) {
+            reject(new Error(`${response.statusCode} ${response.statusMessage || "Request failed"}`));
+            return;
+          }
+          try {
+            resolve(raw ? JSON.parse(raw) : {});
+          } catch (error) {
+            reject(error);
+          }
+        });
+      }
+    );
+    request.setTimeout(800, () => request.destroy(new Error("timeout")));
+    request.on("error", reject);
+    request.end();
+  });
+}
+
+async function discoverLocalServers() {
+  const config = getServerConfig();
+  const host = bridgeState.server.host || config.host;
+  const basePort = config.port;
+  const portSpan = Math.max(config.portSpan || 1, 1);
+  const token = config.token || "";
+  const currentBaseUrl = currentServerBaseUrl();
+  const candidates = Array.from({ length: portSpan }, (_, index) => ({
+    host,
+    port: basePort + index,
+    baseUrl: `http://${host}:${basePort + index}`
+  }));
+
+  const results = await Promise.all(
+    candidates.map(async (candidate) => {
+      try {
+        const status = await requestJson(candidate.baseUrl, "/status", token);
+        return {
+          ok: true,
+          current: candidate.baseUrl === currentBaseUrl,
+          host: candidate.host,
+          port: candidate.port,
+          baseUrl: candidate.baseUrl,
+          window: status.window || null,
+          notebook: status.notebook || null,
+          compliance: status.compliance || null,
+          server: status.server || null
+        };
+      } catch (error) {
+        return {
+          ok: false,
+          current: candidate.baseUrl === currentBaseUrl,
+          host: candidate.host,
+          port: candidate.port,
+          baseUrl: candidate.baseUrl,
+          error: error.message
+        };
+      }
+    })
+  );
+
+  bridgeState.sidebar.servers = results;
+  bridgeState.sidebar.lastUpdatedAt = new Date().toISOString();
+  return results;
+}
+
+async function controlCenterState() {
+  const config = getServerConfig();
+  const editor = activeNotebookEditor();
+  const servers = await discoverLocalServers();
+  return {
+    generatedAt: new Date().toISOString(),
+    server: {
+      running: Boolean(bridgeServer),
+      host: bridgeState.server.host || config.host,
+      port: bridgeState.server.port || config.port,
+      basePort: config.port,
+      portSpan: config.portSpan,
+      baseUrl: currentServerBaseUrl(),
+      startedAt: bridgeState.server.startedAt || null
+    },
+    notebook: activeNotebookInfo(editor),
+    window: windowIdentity(editor),
+    kernel: kernelState(editor),
+    execution: executionState(editor),
+    compliance: complianceState(editor),
+    settings: {
+      host: config.host,
+      port: config.port,
+      portSpan: config.portSpan,
+      autoStart: config.autoStart !== false,
+      followTargetCell: getConfig().get("followTargetCell", true),
+      controlCenterAutoRefresh: getConfig().get("controlCenterAutoRefresh", true),
+      controlCenterRefreshIntervalMs: controlCenterIntervalMs(),
+      allowArbitraryCommands: config.allowArbitraryCommands,
+      allowedCommandPrefixes: config.allowedPrefixes,
+      tokenIsSet: Boolean(config.token),
+      tokenMasked: maskToken(config.token)
+    },
+    ui: {
+      language: String(vscode.env.language || "en")
+    },
+    servers
+  };
+}
+
+let refreshTimer;
+
+function refreshControlCenterSoon(delay = 150) {
+  if (!controlCenterProvider) {
+    return;
+  }
+  clearTimeout(refreshTimer);
+  refreshTimer = setTimeout(() => {
+    controlCenterProvider.refresh().catch((error) => log(`Control center refresh failed: ${error.stack || error.message}`));
+  }, delay);
+}
+
+class DataBridgeControlCenterProvider {
+  constructor(extensionUri) {
+    this.extensionUri = extensionUri;
+    this.view = null;
+    this.refreshInterval = null;
+  }
+
+  resolveWebviewView(webviewView) {
+    this.view = webviewView;
+    webviewView.webview.options = {
+      enableScripts: true,
+      localResourceRoots: [vscode.Uri.joinPath(this.extensionUri, "media")]
+    };
+    webviewView.onDidDispose(() => {
+      this.stopAutoRefresh();
+      this.view = null;
+    });
+    webviewView.onDidChangeVisibility(() => {
+      this.updateAutoRefresh();
+      if (webviewView.visible) {
+        this.refresh().catch((error) => log(`Control center visible refresh failed: ${error.stack || error.message}`));
+      }
+    });
+    webviewView.webview.onDidReceiveMessage(async (message) => {
+      try {
+        await this.handleMessage(message);
+      } catch (error) {
+        vscode.window.showErrorMessage(`Data Bridge Control Center: ${error.message}`);
+        log(`Control Center message failed: ${error.stack || error.message}`);
+      }
+    });
+    this.refresh().catch((error) => log(`Control center initial render failed: ${error.stack || error.message}`));
+    this.updateAutoRefresh();
+  }
+
+  async handleMessage(message) {
+    switch (message.type) {
+      case "refresh":
+        await this.refresh();
+        return;
+      case "startServer":
+        await startServer();
+        return;
+      case "stopServer":
+        await stopServer();
+        return;
+      case "copyServerConfig":
+        await copyServerConfig();
+        return;
+      case "showStatus":
+        showStatus();
+        return;
+      case "openSettings":
+        await vscode.commands.executeCommand("workbench.action.openSettings", "@ext:local.vscode-data-bridge");
+        return;
+      case "setBoolean":
+        await updateBridgeSetting(message.key, Boolean(message.value));
+        return;
+      case "setNumber": {
+        const numeric = toInteger(message.value);
+        if (numeric === null) {
+          throw new Error(`Invalid numeric value for ${message.key}`);
+        }
+        await updateBridgeSetting(message.key, numeric);
+        return;
+      }
+      case "setText":
+        await updateBridgeSetting(message.key, textValue(message.value));
+        return;
+      default:
+        throw new Error(`Unknown control center action: ${message.type}`);
+    }
+  }
+
+  async refresh() {
+    if (!this.view) {
+      return;
+    }
+    const state = await controlCenterState();
+    this.view.webview.html = this.render(state, this.view.webview);
+    this.updateAutoRefresh();
+  }
+
+  render(state, webview) {
+    const strings = localeBundle();
+    const note = state.notebook;
+    const selection = note.selection && note.selection[0] ? `${note.selection[0].start}-${note.selection[0].end}` : strings.none;
+    const visibleRange = note.visibleRange && note.visibleRange[0] ? `${note.visibleRange[0].start}-${note.visibleRange[0].end}` : strings.none;
+    const rows = state.servers
+      .map((server) => {
+        if (!server.ok) {
+          return `<tr><td>${server.current ? strings.current : strings.other}</td><td>${escapeHtml(server.baseUrl)}</td><td>${strings.unavailable}</td><td>${escapeHtml(server.error || "n/a")}</td></tr>`;
+        }
+        return `<tr><td>${server.current ? strings.current : strings.other}</td><td>${escapeHtml(server.baseUrl)}</td><td>${escapeHtml(shortPathLabel(server.notebook && server.notebook.uri))}</td><td>${escapeHtml(server.window && server.window.workspaceName ? server.window.workspaceName : "n/a")}</td></tr>`;
+      })
+      .join("");
+    const nonceValue = nonce();
+    return `<!DOCTYPE html>
+<html lang="${escapeHtml(state.ui.language || "en")}">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonceValue}';" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <style>
+    body { font-family: var(--vscode-font-family); color: var(--vscode-foreground); padding: 10px 12px 24px; }
+    h2 { font-size: 14px; margin: 14px 0 8px; }
+    .row { display: grid; grid-template-columns: 1fr auto; gap: 8px; margin: 5px 0; align-items: center; }
+    .label { color: var(--vscode-descriptionForeground); }
+    .value { word-break: break-word; text-align: right; }
+    .grid { display: grid; gap: 8px; }
+    .card { border: 1px solid var(--vscode-panel-border); border-radius: 8px; padding: 10px; margin-bottom: 10px; }
+    .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+    button { background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: none; border-radius: 4px; padding: 6px 10px; cursor: pointer; }
+    button.secondary { background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); }
+    input[type="text"], input[type="number"] { width: 100%; box-sizing: border-box; padding: 6px; color: var(--vscode-input-foreground); background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border); border-radius: 4px; }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    td, th { border-bottom: 1px solid var(--vscode-panel-border); padding: 6px 4px; text-align: left; vertical-align: top; }
+    .muted { color: var(--vscode-descriptionForeground); font-size: 12px; }
+    .pill { display: inline-block; padding: 2px 6px; border-radius: 999px; background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); font-size: 11px; }
+    .tableWrap { max-height: 170px; overflow: auto; border: 1px solid var(--vscode-panel-border); border-radius: 6px; margin-top: 8px; }
+    .tableWrap table thead th { position: sticky; top: 0; background: var(--vscode-editor-background); z-index: 1; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="row"><div class="label">${strings.currentFocus}</div><div class="value">${escapeHtml(shortPathLabel(note.uri))}</div></div>
+    <div class="row"><div class="label">${strings.notebookUri}</div><div class="value">${escapeHtml(note.uri || strings.none)}</div></div>
+    <div class="row"><div class="label">${strings.selection}</div><div class="value">${escapeHtml(selection)}</div></div>
+    <div class="row"><div class="label">${strings.visibleRange}</div><div class="value">${escapeHtml(visibleRange)}</div></div>
+    <div class="row"><div class="label">${strings.server}</div><div class="value">${escapeHtml(state.server.baseUrl)}</div></div>
+    <div class="row"><div class="label">${strings.kernelBusy}</div><div class="value">${state.kernel.busy ? `<span class="pill">${strings.busy}</span>` : `<span class="pill">${strings.idle}</span>`}</div></div>
+    <div class="row"><div class="label">${strings.bridgeCompliance}</div><div class="value">${state.compliance.bridgeAvailable ? `<span class="pill">${strings.ready}</span>` : `<span class="pill">${strings.offline}</span>`}</div></div>
+    <div class="actions">
+      <button data-action="refresh">${strings.refresh}</button>
+      <button data-action="copyServerConfig" class="secondary">${strings.copyConfig}</button>
+      <button data-action="showStatus" class="secondary">${strings.showStatus}</button>
+      <button data-action="${state.server.running ? "stopServer" : "startServer"}" class="secondary">${state.server.running ? strings.stopServer : strings.startServer}</button>
+    </div>
+  </div>
+
+  <h2>${strings.servers}</h2>
+  <div class="card">
+    <div class="muted">${escapeHtml(t("localBridgeScan", { start: state.server.basePort, end: state.server.basePort + Math.max(state.server.portSpan - 1, 0) }))}</div>
+    <div class="muted">${strings.visibleOnlyNote}</div>
+    <div class="tableWrap">
+      <table>
+        <thead><tr><th>${strings.role}</th><th>${strings.baseUrl}</th><th>${strings.notebook}</th><th>${strings.workspace}</th></tr></thead>
+        <tbody>${rows || `<tr><td colspan="4">${strings.noServers}</td></tr>`}</tbody>
+      </table>
+    </div>
+  </div>
+
+  <h2>${strings.settings}</h2>
+  <div class="card grid">
+    <label><input type="checkbox" data-setting="autoStart" ${state.settings.autoStart ? "checked" : ""}/> ${strings.autoStart}</label>
+    <label><input type="checkbox" data-setting="followTargetCell" ${state.settings.followTargetCell ? "checked" : ""}/> ${strings.followTargetCell}</label>
+    <label><input type="checkbox" data-setting="controlCenterAutoRefresh" ${state.settings.controlCenterAutoRefresh ? "checked" : ""}/> ${strings.autoRefresh}</label>
+    <label><input type="checkbox" data-setting="allowArbitraryCommands" ${state.settings.allowArbitraryCommands ? "checked" : ""}/> ${strings.allowArbitraryCommands}</label>
+    <div>
+      <div class="muted">${strings.host}</div>
+      <input type="text" data-text-setting="host" value="${escapeHtml(state.settings.host)}" />
+    </div>
+    <div>
+      <div class="muted">${strings.basePort}</div>
+      <input type="number" data-number-setting="port" value="${escapeHtml(String(state.settings.port))}" />
+    </div>
+    <div>
+      <div class="muted">${strings.portSpan}</div>
+      <input type="number" data-number-setting="portSpan" value="${escapeHtml(String(state.settings.portSpan))}" />
+    </div>
+    <div>
+      <div class="muted">${strings.refreshInterval}</div>
+      <input type="number" data-number-setting="controlCenterRefreshIntervalMs" value="${escapeHtml(String(state.settings.controlCenterRefreshIntervalMs))}" />
+    </div>
+    <div>
+      <div class="muted">${strings.token}</div>
+      <input type="text" data-text-setting="token" value="" placeholder="${escapeHtml(state.settings.tokenIsSet ? state.settings.tokenMasked : strings.notSet)}" />
+    </div>
+    <div class="actions">
+      <button data-action="openSettings" class="secondary">${strings.openFullSettings}</button>
+      <button data-action="refresh" class="secondary">${strings.reloadView}</button>
+    </div>
+  </div>
+
+  <h2>${strings.safety}</h2>
+  <div class="card">
+    <div class="row"><div class="label">${strings.fallbackAllowed}</div><div class="value">${state.compliance.fallbackAllowed ? strings.yes : strings.no}</div></div>
+    <div class="row"><div class="label">${strings.mutationRequired}</div><div class="value">${state.compliance.bridgeMutationRequired ? strings.bridgeRequired : strings.optional}</div></div>
+    <div class="row"><div class="label">${strings.executionRequired}</div><div class="value">${state.compliance.bridgeExecutionRequired ? strings.bridgeRequired : strings.optional}</div></div>
+    <div class="row"><div class="label">${strings.identityStable}</div><div class="value">${state.compliance.activeNotebookIdentityStable ? strings.yes : strings.no}</div></div>
+  </div>
+
+  <script nonce="${nonceValue}">
+    const vscode = acquireVsCodeApi();
+    document.querySelectorAll('[data-action]').forEach((button) => {
+      button.addEventListener('click', () => vscode.postMessage({ type: button.dataset.action }));
+    });
+    document.querySelectorAll('[data-setting]').forEach((input) => {
+      input.addEventListener('change', () => vscode.postMessage({
+        type: 'setBoolean',
+        key: input.dataset.setting,
+        value: input.checked
+      }));
+    });
+    document.querySelectorAll('[data-number-setting]').forEach((input) => {
+      input.addEventListener('change', () => vscode.postMessage({
+        type: 'setNumber',
+        key: input.dataset.numberSetting,
+        value: input.value
+      }));
+    });
+    document.querySelectorAll('[data-text-setting]').forEach((input) => {
+      input.addEventListener('change', () => vscode.postMessage({
+        type: 'setText',
+        key: input.dataset.textSetting,
+        value: input.value
+      }));
+    });
+  </script>
+</body>
+</html>`;
+  }
+
+  updateAutoRefresh() {
+    if (!this.view) {
+      this.stopAutoRefresh();
+      return;
+    }
+    const enabled = getConfig().get("controlCenterAutoRefresh", true);
+    if (!enabled || !this.view.visible) {
+      this.stopAutoRefresh();
+      return;
+    }
+    const intervalMs = controlCenterIntervalMs();
+    if (this.refreshInterval && this.refreshInterval.intervalMs === intervalMs) {
+      return;
+    }
+    this.stopAutoRefresh();
+    const handle = setInterval(() => {
+      if (!this.view || !this.view.visible) {
+        return;
+      }
+      this.refresh().catch((error) => log(`Control center auto-refresh failed: ${error.stack || error.message}`));
+    }, intervalMs);
+    this.refreshInterval = { handle, intervalMs };
+  }
+
+  stopAutoRefresh() {
+    if (this.refreshInterval) {
+      clearInterval(this.refreshInterval.handle);
+      this.refreshInterval = null;
+    }
+  }
+}
+
+async function openControlCenter() {
+  await vscode.commands.executeCommand("workbench.view.extension.dataBridgeSidebar");
+  refreshControlCenterSoon(0);
+}
+
+async function refreshControlCenter() {
+  if (controlCenterProvider) {
+    await controlCenterProvider.refresh();
+  }
+}
+
+async function handleConfigurationChange(event) {
+  const serverRelevantKeys = [
+    "dataBridge.host",
+    "dataBridge.port",
+    "dataBridge.portSpan",
+    "dataBridge.token"
+  ];
+  if (bridgeServer && serverRelevantKeys.some((key) => event.affectsConfiguration(key))) {
+    await stopServer();
+    await startServer();
+  }
 }
 
 function textValue(value, fallback = "") {
@@ -219,6 +911,10 @@ function serializeRange(range) {
   return { start: range.start, end: range.end };
 }
 
+function selectionSnapshot(editor) {
+  return editor ? editor.selections.map((range) => serializeRange(range)) : [];
+}
+
 function decodeOutputItem(item) {
   try {
     return Buffer.from(item.data).toString("utf8");
@@ -269,8 +965,44 @@ function executionSummary(cell) {
   };
 }
 
+function stableHash(value) {
+  const text = typeof value === "string" ? value : JSON.stringify(value || {});
+  let hash = 2166136261;
+  for (let i = 0; i < text.length; i += 1) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(16);
+}
+
 function cellId(cell) {
   return cell.document.uri.toString();
+}
+
+function cellReadToken(cell, index) {
+  return [
+    cellId(cell),
+    index,
+    stableHash(cell.document.getText()),
+    stableHash(cell.metadata || {}),
+    (cell.outputs || []).length
+  ].join(":");
+}
+
+function assertReadTokenMatches(cell, index, payload = {}) {
+  const expected = textValue(payload.readToken || payload.expectedReadToken || payload.ifMatchReadToken);
+  if (!expected) {
+    return;
+  }
+  const actual = cellReadToken(cell, index);
+  if (expected !== actual) {
+    throw structuredError("CELL_STALE_READ", `Cell ${index} changed since it was last read`, {
+      index,
+      cellId: cellId(cell),
+      expectedReadToken: expected,
+      actualReadToken: actual
+    });
+  }
 }
 
 function notebookUri(editorOrNotebook) {
@@ -279,6 +1011,27 @@ function notebookUri(editorOrNotebook) {
   }
   const notebook = editorOrNotebook.notebook || editorOrNotebook;
   return notebook && notebook.uri ? notebook.uri.toString() : null;
+}
+
+function workspaceRoots() {
+  return (vscode.workspace.workspaceFolders || []).map((folder) => ({
+    name: folder.name,
+    uri: folder.uri.toString(),
+    path: folder.uri.fsPath
+  }));
+}
+
+function windowIdentity(editor = activeNotebookEditor()) {
+  const roots = workspaceRoots();
+  const notebook = activeNotebookInfo(editor);
+  return {
+    workspaceName: vscode.workspace.name || null,
+    rootPaths: roots.map((root) => root.path),
+    rootUris: roots.map((root) => root.uri),
+    activeNotebookUri: notebook.uri,
+    notebookType: notebook.notebookType,
+    hasActiveNotebook: notebook.hasActiveNotebook
+  };
 }
 
 function notebookRuntimeRecord(uri) {
@@ -302,10 +1055,28 @@ function notebookRuntimeRecord(uri) {
       pendingTargets: [],
       lastObservedExecutionOrder: null,
       lastObservedCellIds: [],
-      lastObservedNotebookVersion: 0
+      lastObservedNotebookVersion: 0,
+      lastObservedMutationAt: null,
+      lastMutationCellIds: [],
+      completionObservedAt: null,
+      outputObservedAt: null,
+      idleObservedAt: null,
+      identityDrifted: false,
+      driftedAt: null,
+      driftReason: null,
+      selectionSnapshot: []
     };
   }
   return bridgeState.notebookRuntime[uri];
+}
+
+function notebookVersionToken(editor = activeNotebookEditor()) {
+  const uri = notebookUri(editor);
+  const runtime = notebookRuntimeRecord(uri);
+  if (!uri || !runtime) {
+    return null;
+  }
+  return `${uri}#${runtime.lastObservedNotebookVersion}`;
 }
 
 function activeRuntime(editor = activeNotebookEditor()) {
@@ -318,11 +1089,68 @@ function updateActiveNotebookIdentity(editor, reason) {
   bridgeState.activeNotebook.uri = uri;
   bridgeState.activeNotebook.switchedAt = new Date().toISOString();
   bridgeState.activeNotebook.switchCount += 1;
+  bridgeState.activeNotebook.selectionSnapshot = selectionSnapshot(editor);
   const runtime = notebookRuntimeRecord(uri);
   if (runtime) {
     runtime.lastActivatedAt = bridgeState.activeNotebook.switchedAt;
     runtime.lastIdentityReason = reason;
     runtime.lastSelectionSeenAt = editor && editor.selections ? new Date().toISOString() : runtime.lastSelectionSeenAt;
+    runtime.selectionSnapshot = selectionSnapshot(editor);
+  }
+  bridgeState.activeNotebook.versionToken = notebookVersionToken(editor);
+  observeIdentityDrift(editor, reason);
+}
+
+function updateSelectionObservation(editor, reason) {
+  const uri = notebookUri(editor);
+  const runtime = notebookRuntimeRecord(uri);
+  const snapshot = selectionSnapshot(editor);
+  bridgeState.activeNotebook.selectionSnapshot = snapshot;
+  bridgeState.activeNotebook.versionToken = notebookVersionToken(editor);
+  if (runtime) {
+    runtime.lastSelectionSeenAt = new Date().toISOString();
+    runtime.selectionSnapshot = snapshot;
+  }
+  observeIdentityDrift(editor, reason);
+}
+
+function targetMatchesSelection(editor, target) {
+  if (!editor || !target) {
+    return true;
+  }
+  if (target.selection === "current" || target.scope === "all") {
+    return true;
+  }
+  const current = editor.selections && editor.selections[0];
+  if (!current) {
+    return false;
+  }
+  if (typeof target.index === "number") {
+    return current.start <= target.index && current.end > target.index;
+  }
+  return true;
+}
+
+function observeIdentityDrift(editor, reason) {
+  const lastExecution = bridgeState.lastExecution;
+  if (!lastExecution || !lastExecution.pendingObservation) {
+    return;
+  }
+  const currentUri = notebookUri(editor);
+  const runtime = notebookRuntimeRecord(lastExecution.notebookUri);
+  if (!runtime) {
+    return;
+  }
+  const uriDrifted = currentUri !== lastExecution.notebookUri;
+  const selectionDrifted = currentUri === lastExecution.notebookUri && !targetMatchesSelection(editor, lastExecution.target);
+  if (uriDrifted || selectionDrifted) {
+    const driftedAt = new Date().toISOString();
+    runtime.identityDrifted = true;
+    runtime.driftedAt = driftedAt;
+    runtime.driftReason = uriDrifted ? "active-notebook-changed" : reason || "selection-changed";
+    lastExecution.identityStable = false;
+    lastExecution.identityDrifted = true;
+    lastExecution.identityDriftedAt = driftedAt;
   }
 }
 
@@ -336,25 +1164,41 @@ function updateNotebookRuntimeFromEvent(event) {
   runtime.statusKnown = true;
   runtime.lastDocumentChangeAt = changedAt;
   runtime.lastObservedNotebookVersion += 1;
+  bridgeState.activeNotebook.versionToken = notebookVersionToken(activeNotebookEditor());
   const outputChanged = event.cellChanges.some((change) => Array.isArray(change.outputs) && change.outputs.length >= 0);
   const executionChanged = event.cellChanges.some((change) => change.executionSummary !== undefined);
 
   if (outputChanged) {
     runtime.outputChangeCount += 1;
     runtime.lastOutputChangeAt = changedAt;
+    runtime.outputObservedAt = changedAt;
+    if (bridgeState.lastExecution && bridgeState.lastExecution.notebookUri === uri) {
+      bridgeState.lastExecution.outputObserved = true;
+      bridgeState.lastExecution.outputObservedAt = changedAt;
+    }
   }
 
   if (executionChanged) {
     runtime.executionChangeCount += 1;
     runtime.lastExecutionCompletedAt = changedAt;
+    runtime.completionObservedAt = changedAt;
     runtime.busy = false;
     runtime.pendingTargets = [];
+    runtime.idleObservedAt = changedAt;
     if (bridgeState.lastExecution && bridgeState.lastExecution.notebookUri === uri) {
       bridgeState.lastExecution.pendingObservation = false;
       bridgeState.lastExecution.completedAt = changedAt;
+      bridgeState.lastExecution.completionObserved = true;
+      bridgeState.lastExecution.identityStable = !runtime.identityDrifted;
     }
   } else if (outputChanged && runtime.pendingTargets.length > 0) {
     runtime.busy = true;
+  }
+
+  if ((outputChanged || executionChanged) && bridgeState.lastMutation && bridgeState.lastMutation.notebookUri === uri) {
+    runtime.lastObservedMutationAt = changedAt;
+    bridgeState.lastMutation.lastMutationObservedAt = changedAt;
+    bridgeState.lastMutation.lastMutationApplied = true;
   }
 
   const observedCells = event.cellChanges
@@ -362,6 +1206,7 @@ function updateNotebookRuntimeFromEvent(event) {
     .map((change) => cellId(change.cell));
   if (observedCells.length > 0) {
     runtime.lastObservedCellIds = observedCells;
+    runtime.lastMutationCellIds = observedCells;
   }
 
   const observedExecutionOrder = event.cellChanges
@@ -377,6 +1222,7 @@ function serializeCell(cell, index, options = {}) {
   return {
     index,
     id: cellId(cell),
+    readToken: cellReadToken(cell, index),
     kind: cell.kind === vscode.NotebookCellKind.Markup ? "markdown" : "code",
     languageId: cell.document.languageId,
     source: options.includeSource === false ? undefined : source,
@@ -404,13 +1250,27 @@ function activeNotebookInfo(editor = activeNotebookEditor()) {
     visibleRange: editor ? editor.visibleRanges.map((range) => serializeRange(range)) : [],
     selection: editor ? editor.selections.map((range) => serializeRange(range)) : [],
     identity: {
+      uri: bridgeState.activeNotebook.uri,
       activeUri: bridgeState.activeNotebook.uri,
+      versionToken: notebookVersionToken(editor),
       switchedAt: bridgeState.activeNotebook.switchedAt,
       switchCount: bridgeState.activeNotebook.switchCount,
       visibleEditors: bridgeState.activeNotebook.visibleEditors,
+      selectionSnapshot: selectionSnapshot(editor),
       lastActivatedAt: runtime ? runtime.lastActivatedAt : null,
       lastIdentityReason: runtime ? runtime.lastIdentityReason : null
     }
+  };
+}
+
+function mutationState(editor = activeNotebookEditor()) {
+  const runtime = activeRuntime(editor);
+  return {
+    lastMutation: bridgeState.lastMutation,
+    lastMutationTarget: bridgeState.lastMutation ? bridgeState.lastMutation.target || null : null,
+    lastMutationApplied: Boolean(bridgeState.lastMutation && bridgeState.lastMutation.lastMutationApplied),
+    lastMutationObservedAt: runtime ? runtime.lastObservedMutationAt : null,
+    lastMutationSource: bridgeState.lastMutation ? bridgeState.lastMutation.source || "bridge" : null
   };
 }
 
@@ -425,6 +1285,7 @@ function kernelState(editor = activeNotebookEditor()) {
     executionRequestedAt: runtime ? runtime.executionRequestedAt : null,
     lastExecutionCompletedAt: runtime ? runtime.lastExecutionCompletedAt : null,
     lastOutputChangeAt: runtime ? runtime.lastOutputChangeAt : null,
+    idleObservedAt: runtime ? runtime.idleObservedAt : null,
     pendingTargets: runtime ? runtime.pendingTargets : [],
     lastKernelAction: bridgeState.lastKernelAction,
     lastExecution: bridgeState.lastExecution
@@ -448,9 +1309,21 @@ function debugState(editor = activeNotebookEditor()) {
 
 function executionState(editor = activeNotebookEditor()) {
   const runtime = activeRuntime(editor);
+  const inferred = inferredExecutionObservation(editor);
   return {
     notebook: activeNotebookInfo(editor),
     kernel: kernelState(editor),
+    requestedAt: bridgeState.lastExecution ? bridgeState.lastExecution.at : null,
+    pending: Boolean(runtime && runtime.busy),
+    pendingTargets: runtime ? runtime.pendingTargets : [],
+    completedAt: bridgeState.lastExecution ? bridgeState.lastExecution.completedAt || null : null,
+    completionObserved: inferred.completionObserved,
+    outputObserved: inferred.outputObserved,
+    outputObservedAt: inferred.outputObservedAt,
+    busy: Boolean(runtime && runtime.busy),
+    idleObservedAt: runtime ? runtime.idleObservedAt : null,
+    identityStable: inferred.identityStable,
+    identityDrifted: Boolean(bridgeState.lastExecution && bridgeState.lastExecution.identityDrifted),
     lastExecution: bridgeState.lastExecution,
     pendingObservation: Boolean(bridgeState.lastExecution && bridgeState.lastExecution.pendingObservation),
     observed: runtime
@@ -459,9 +1332,53 @@ function executionState(editor = activeNotebookEditor()) {
           outputChangeCount: runtime.outputChangeCount,
           lastDocumentChangeAt: runtime.lastDocumentChangeAt,
           lastObservedExecutionOrder: runtime.lastObservedExecutionOrder,
-          lastObservedCellIds: runtime.lastObservedCellIds
+          lastObservedCellIds: runtime.lastObservedCellIds,
+          completionObservedAt: runtime.completionObservedAt,
+          outputObservedAt: runtime.outputObservedAt,
+          identityDrifted: runtime.identityDrifted,
+          driftedAt: runtime.driftedAt,
+          driftReason: runtime.driftReason
         }
       : null
+  };
+}
+
+function complianceState(editor = activeNotebookEditor()) {
+  const runtime = activeRuntime(editor);
+  const execution = bridgeState.lastExecution;
+  const inferred = inferredExecutionObservation(editor);
+  return {
+    bridgeAvailable: Boolean(bridgeServer),
+    bridgeMutationRequired: true,
+    bridgeExecutionRequired: true,
+    fallbackAllowed: false,
+    fallbackReason: null,
+    activeNotebookIdentityStable: Boolean(!runtime || !runtime.identityDrifted),
+    lastMutationBridgeConfirmed: Boolean(bridgeState.lastMutation && bridgeState.lastMutation.lastMutationApplied),
+    lastExecutionBridgeConfirmed: Boolean(execution && inferred.completionObserved && inferred.outputObserved && inferred.identityStable),
+    lastMutationSource: bridgeState.lastMutation ? bridgeState.lastMutation.source || "bridge" : null,
+    lastExecutionSource: execution ? "bridge" : null
+  };
+}
+
+function briefState(editor = activeNotebookEditor()) {
+  const notebook = activeNotebookInfo(editor);
+  const execution = executionState(editor);
+  const compliance = complianceState(editor);
+  const server = {
+    host: bridgeState.server.host || getServerConfig().host,
+    port: bridgeState.server.port || getServerConfig().port,
+    baseUrl: currentServerBaseUrl()
+  };
+  return {
+    hasActiveNotebook: notebook.hasActiveNotebook,
+    uri: notebook.uri,
+    selection: notebook.selection,
+    versionToken: notebook.identity.versionToken,
+    busy: execution.busy,
+    bridgeAvailable: compliance.bridgeAvailable,
+    identityStable: compliance.activeNotebookIdentityStable,
+    server
   };
 }
 
@@ -470,8 +1387,12 @@ function capabilities() {
     endpoints: DEFAULT_ENDPOINTS,
     commands: QUICK_COMMANDS,
     supports: {
+      serverDiscovery: true,
       notebookState: true,
+      multiWindowDiscovery: true,
+      compliance: true,
       cellCrud: true,
+      workflowOps: true,
       execution: true,
       debugCommands: true,
       outputRead: true,
@@ -509,12 +1430,23 @@ function responseError(error, operation) {
   };
 }
 
-function okResponse(operation, payload = {}) {
+function okResponse(operation, payload = {}, options = {}) {
+  if (options.includeState === false) {
+    return {
+      ok: true,
+      operation,
+      ...payload
+    };
+  }
   return {
     ok: true,
     operation,
     notebook: activeNotebookInfo(),
     kernel: kernelState(),
+    mutation: mutationState(),
+    execution: executionState(),
+    compliance: complianceState(),
+    window: windowIdentity(),
     ...payload
   };
 }
@@ -630,6 +1562,60 @@ function findCell(editor, locator = {}, options = {}) {
   throw structuredError("CELL_LOCATOR_REQUIRED", "A cell locator is required");
 }
 
+function resolveCellFromTarget(editor, target) {
+  if (!editor || !target) {
+    return null;
+  }
+  try {
+    if (typeof target.index === "number") {
+      return findCell(editor, { index: target.index });
+    }
+    if (target.id) {
+      return findCell(editor, { id: target.id });
+    }
+    if (target.selection === "current") {
+      return findCell(editor, { selection: "current" });
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+function hasCellOutputs(cell) {
+  return Boolean(cell && Array.isArray(cell.outputs) && cell.outputs.length > 0);
+}
+
+function inferredExecutionObservation(editor = activeNotebookEditor()) {
+  const execution = bridgeState.lastExecution;
+  if (!editor || !execution || execution.notebookUri !== notebookUri(editor)) {
+    return {
+      completionObserved: Boolean(execution && execution.completionObserved),
+      outputObserved: Boolean(execution && execution.outputObserved),
+      outputObservedAt: execution ? execution.outputObservedAt || null : null,
+      identityStable: execution ? execution.identityStable !== false : true
+    };
+  }
+
+  const runtime = activeRuntime(editor);
+  const target = resolveCellFromTarget(editor, execution.target);
+  const completionObserved = Boolean(execution.completionObserved || (runtime && runtime.completionObservedAt));
+  const outputObserved = Boolean(execution.outputObserved || (target && hasCellOutputs(target.cell)));
+  const outputObservedAt = execution.outputObservedAt || (outputObserved && runtime ? runtime.outputObservedAt || runtime.lastDocumentChangeAt : null);
+
+  if (outputObserved && !execution.outputObserved) {
+    execution.outputObserved = true;
+    execution.outputObservedAt = outputObservedAt;
+  }
+
+  return {
+    completionObserved,
+    outputObserved,
+    outputObservedAt,
+    identityStable: execution.identityStable !== false
+  };
+}
+
 function cloneCellData(cell, overrides = {}) {
   const nextKind = notebookKind(overrides.kind ?? cell.kind);
   const nextSource = normalizeSource(overrides.source ?? cell.document.getText());
@@ -642,7 +1628,7 @@ function cloneCellData(cell, overrides = {}) {
 
 async function applyNotebookCellReplacement(editor, start, end, cellData) {
   const edit = new vscode.WorkspaceEdit();
-  edit.replaceNotebookCells(editor.notebook.uri, new vscode.NotebookRange(start, end), cellData);
+  edit.set(editor.notebook.uri, [vscode.NotebookEdit.replaceCells(new vscode.NotebookRange(start, end), cellData)]);
   const applied = await vscode.workspace.applyEdit(edit);
   if (!applied) {
     throw structuredError("EDIT_REJECTED", "Notebook edit was rejected");
@@ -661,8 +1647,8 @@ async function applyNotebookMetadataEdit(editor, notebookEdits) {
 async function selectCell(editor, index, options = {}) {
   const range = new vscode.NotebookRange(index, index + 1);
   editor.selections = [range];
-  if (options.reveal !== false) {
-    editor.revealRange(range);
+  if (options.reveal !== false && shouldFollowTargetCell(options.forceReveal)) {
+    await revealCellSmoothly(editor, index, options);
   }
   return range;
 }
@@ -714,6 +1700,18 @@ function buildOutputs(outputs = []) {
   return outputs.map((outputSpec) => new vscode.NotebookCellOutput(buildOutputItems(outputSpec.items || []), outputSpec.metadata || {}));
 }
 
+function cellOutputSummary(cell) {
+  return (cell.outputs || []).map((output) => summarizeOutput(output));
+}
+
+function cellHasErrorOutput(cell) {
+  return Boolean(
+    (cell.outputs || []).some((output) =>
+      output.items.some((item) => item.mime === "application/vnd.code.notebook.error" || item.mime === "application/vnd.code.notebook.stderr")
+    )
+  );
+}
+
 async function executeCommand(commandId, args = [], meta = {}) {
   log(`Executing command: ${commandId}`);
   const currentEditor = activeNotebookEditor();
@@ -726,13 +1724,22 @@ async function executeCommand(commandId, args = [], meta = {}) {
       at: new Date().toISOString(),
       target: meta.target || null,
       pendingObservation: true,
-      notebookUri: currentUri
+      notebookUri: currentUri,
+      completionObserved: false,
+      outputObserved: false,
+      outputObservedAt: null,
+      completedAt: null,
+      identityStable: true,
+      identityDrifted: false
     };
     if (runtime) {
       runtime.statusKnown = true;
       runtime.busy = true;
       runtime.executionRequestedAt = bridgeState.lastExecution.at;
       runtime.pendingTargets = meta.target ? [meta.target] : [];
+      runtime.identityDrifted = false;
+      runtime.driftedAt = null;
+      runtime.driftReason = null;
     }
   }
   if (meta.kind === "debug") {
@@ -790,13 +1797,14 @@ async function executeCellByIndex(index, options = {}) {
         kind: "execution",
         target: { index: target.index, id: cellId(target.cell) }
       });
+      const targetId = cellId(target.cell);
       return okResponse("executeCellByIndex", {
-        cell: serializeCell(target.cell, target.index),
-        selection: activeNotebookInfo(editor).selection,
+        index: target.index,
+        cellId: targetId,
         accepted: true,
         pendingObservation: true,
         summary: `Execution requested for cell ${target.index}`
-      });
+      }, { includeState: false });
     },
     { restoreSelection: toBoolean(options.restoreSelection, false) }
   );
@@ -824,30 +1832,65 @@ async function insertCell(payload, append = false) {
   cellData.metadata = payload.metadata || {};
   cellData.outputs = [];
   await applyNotebookCellReplacement(editor, index, index, [cellData]);
-  bridgeState.lastMutation = { operation: append ? "cell.append" : "cell.insert", at: new Date().toISOString(), index };
+  bridgeState.lastMutation = {
+    operation: append ? "cell.append" : "cell.insert",
+    at: new Date().toISOString(),
+    notebookUri: notebookUri(editor),
+    target: { index },
+    index,
+    source: "bridge",
+    lastMutationApplied: true,
+    lastMutationObservedAt: new Date().toISOString()
+  };
   const updatedEditor = getEditorOrThrow();
   const insertedCell = updatedEditor.notebook.cellAt(index);
+  const insertedId = cellId(insertedCell);
+  if (!toBoolean(payload.noFollow, false) && shouldFollowTargetCell(false)) {
+    await selectCell(updatedEditor, index, { reveal: true });
+  }
   return okResponse(append ? "cell.append" : "cell.insert", {
-    cell: serializeCell(insertedCell, index),
+    index,
+    cellId: insertedId,
+    cell: toBoolean(payload.includeCell, false) ? compactCellSummary(serializeCell(insertedCell, index)) : undefined,
+    applied: true,
+    identityStable: true,
     summary: `${append ? "Appended" : "Inserted"} cell at ${index}`
-  });
+  }, { includeState: false });
 }
 
 async function updateCell(payload) {
   const editor = getEditorOrThrow();
   const target = findCell(editor, payload);
+  assertReadTokenMatches(target.cell, target.index, payload);
   const nextData = cloneCellData(target.cell, {
     kind: payload.kind,
     source: payload.source !== undefined ? payload.source : target.cell.document.getText(),
     metadata: payload.metadata !== undefined ? payload.metadata : target.cell.metadata
   });
   await applyNotebookCellReplacement(editor, target.index, target.index + 1, [nextData]);
-  bridgeState.lastMutation = { operation: "cell.update", at: new Date().toISOString(), index: target.index };
+  bridgeState.lastMutation = {
+    operation: "cell.update",
+    at: new Date().toISOString(),
+    notebookUri: notebookUri(editor),
+    target: { index: target.index, id: cellId(target.cell) },
+    index: target.index,
+    source: "bridge",
+    lastMutationApplied: true,
+    lastMutationObservedAt: new Date().toISOString()
+  };
   const refreshedCell = getEditorOrThrow().notebook.cellAt(target.index);
+  const refreshedId = cellId(refreshedCell);
+  if (!toBoolean(payload.noFollow, false) && shouldFollowTargetCell(false)) {
+    await selectCell(getEditorOrThrow(), target.index, { reveal: true });
+  }
   return okResponse("cell.update", {
-    cell: serializeCell(refreshedCell, target.index),
+    index: target.index,
+    cellId: refreshedId,
+    cell: toBoolean(payload.includeCell, false) ? compactCellSummary(serializeCell(refreshedCell, target.index)) : undefined,
+    applied: true,
+    identityStable: true,
     summary: `Updated cell ${target.index}`
-  });
+  }, { includeState: false });
 }
 
 async function deleteCells(payload) {
@@ -858,6 +1901,7 @@ async function deleteCells(payload) {
     .sort((a, b) => a - b);
   if (indexes.length === 0) {
     const target = findCell(editor, payload);
+    assertReadTokenMatches(target.cell, target.index, payload);
     indexes.push(target.index);
   }
   const uniqueIndexes = [...new Set(indexes)];
@@ -870,16 +1914,26 @@ async function deleteCells(payload) {
     const index = uniqueIndexes[i];
     await applyNotebookCellReplacement(editor, index, index + 1, []);
   }
-  bridgeState.lastMutation = { operation: "cell.delete", at: new Date().toISOString(), indexes: uniqueIndexes };
+  bridgeState.lastMutation = {
+    operation: "cell.delete",
+    at: new Date().toISOString(),
+    notebookUri: notebookUri(editor),
+    target: { indexes: uniqueIndexes },
+    indexes: uniqueIndexes,
+    source: "bridge",
+    lastMutationApplied: true,
+    lastMutationObservedAt: new Date().toISOString()
+  };
   return okResponse("cell.delete", {
     result: { deletedIndexes: uniqueIndexes },
     summary: `Deleted ${uniqueIndexes.length} cell(s)`
-  });
+  }, { includeState: false });
 }
 
 async function moveCell(payload) {
   const editor = getEditorOrThrow();
   const target = findCell(editor, payload);
+  assertReadTokenMatches(target.cell, target.index, payload);
   const allCells = getNotebookCells(editor);
   const destinationIndex =
     payload.toIndex !== undefined
@@ -896,25 +1950,56 @@ async function moveCell(payload) {
   const [moved] = cellDatas.splice(target.index, 1);
   cellDatas.splice(destinationIndex, 0, moved);
   await applyNotebookCellReplacement(editor, 0, allCells.length, cellDatas);
-  bridgeState.lastMutation = { operation: "cell.move", at: new Date().toISOString(), from: target.index, to: destinationIndex };
+  bridgeState.lastMutation = {
+    operation: "cell.move",
+    at: new Date().toISOString(),
+    notebookUri: notebookUri(editor),
+    target: { from: target.index, to: destinationIndex, id: cellId(target.cell) },
+    from: target.index,
+    to: destinationIndex,
+    source: "bridge",
+    lastMutationApplied: true,
+    lastMutationObservedAt: new Date().toISOString()
+  };
+  if (!toBoolean(payload.noFollow, false) && shouldFollowTargetCell(false)) {
+    await selectCell(getEditorOrThrow(), destinationIndex, { reveal: true });
+  }
   return okResponse("cell.move", {
+    index: destinationIndex,
     result: { from: target.index, to: destinationIndex },
     summary: `Moved cell ${target.index} to ${destinationIndex}`
-  });
+  }, { includeState: false });
 }
 
 async function duplicateCell(payload) {
   const editor = getEditorOrThrow();
   const target = findCell(editor, payload);
+  assertReadTokenMatches(target.cell, target.index, payload);
   const duplicate = cloneCellData(target.cell);
   const insertIndex = toInteger(payload.toIndex, target.index + 1);
   await applyNotebookCellReplacement(editor, insertIndex, insertIndex, [duplicate]);
-  bridgeState.lastMutation = { operation: "cell.duplicate", at: new Date().toISOString(), from: target.index, to: insertIndex };
+  bridgeState.lastMutation = {
+    operation: "cell.duplicate",
+    at: new Date().toISOString(),
+    notebookUri: notebookUri(editor),
+    target: { from: target.index, to: insertIndex, id: cellId(target.cell) },
+    from: target.index,
+    to: insertIndex,
+    source: "bridge",
+    lastMutationApplied: true,
+    lastMutationObservedAt: new Date().toISOString()
+  };
   const inserted = getEditorOrThrow().notebook.cellAt(insertIndex);
+  const insertedId = cellId(inserted);
+  if (!toBoolean(payload.noFollow, false) && shouldFollowTargetCell(false)) {
+    await selectCell(getEditorOrThrow(), insertIndex, { reveal: true });
+  }
   return okResponse("cell.duplicate", {
-    cell: serializeCell(inserted, insertIndex),
+    index: insertIndex,
+    cellId: insertedId,
+    cell: toBoolean(payload.includeCell, false) ? compactCellSummary(serializeCell(inserted, insertIndex)) : undefined,
     summary: `Duplicated cell ${target.index} to ${insertIndex}`
-  });
+  }, { includeState: false });
 }
 
 async function selectTargetCell(payload, revealOnly = false) {
@@ -924,51 +2009,562 @@ async function selectTargetCell(payload, revealOnly = false) {
   if (!revealOnly) {
     editor.selections = [range];
   }
-  editor.revealRange(range);
+  if (!toBoolean(payload.noFollow, false) && (revealOnly || shouldFollowTargetCell(true))) {
+    await revealCellSmoothly(editor, target.index, { forceReveal: true });
+  }
   return okResponse(revealOnly ? "cell.reveal" : "cell.select", {
-    cell: serializeCell(target.cell, target.index),
+    index: target.index,
+    cellId: cellId(target.cell),
     selection: activeNotebookInfo(editor).selection,
+    cell: toBoolean(payload.includeCell, false) ? compactCellSummary(serializeCell(target.cell, target.index)) : undefined,
     summary: `${revealOnly ? "Revealed" : "Selected"} cell ${target.index}`
-  });
+  }, { includeState: false });
 }
 
 async function replaceOutputs(payload) {
   const editor = getEditorOrThrow();
   const target = findCell(editor, payload);
+  assertReadTokenMatches(target.cell, target.index, payload);
   const outputs = buildOutputs(payload.outputs || []);
   await applyNotebookMetadataEdit(editor, [vscode.NotebookEdit.updateCellOutputs(target.index, outputs)]);
-  bridgeState.lastMutation = { operation: "cell.replaceOutputs", at: new Date().toISOString(), index: target.index };
+  bridgeState.lastMutation = {
+    operation: "cell.replaceOutputs",
+    at: new Date().toISOString(),
+    notebookUri: notebookUri(editor),
+    target: { index: target.index, id: cellId(target.cell) },
+    index: target.index,
+    source: "bridge",
+    lastMutationApplied: true,
+    lastMutationObservedAt: new Date().toISOString()
+  };
   const refreshedCell = getEditorOrThrow().notebook.cellAt(target.index);
+  if (!toBoolean(payload.noFollow, false) && shouldFollowTargetCell(false)) {
+    await selectCell(getEditorOrThrow(), target.index, { reveal: true });
+  }
   return okResponse("cell.replaceOutputs", {
-    cell: serializeCell(refreshedCell, target.index),
+    index: target.index,
+    cellId: cellId(refreshedCell),
+    cell: toBoolean(payload.includeCell, false) ? compactCellSummary(serializeCell(refreshedCell, target.index)) : undefined,
     summary: `Replaced outputs for cell ${target.index}`
-  });
+  }, { includeState: false });
 }
 
 async function clearOutputs(payload) {
   const editor = getEditorOrThrow();
   if (toBoolean(payload.all, false)) {
     await executeCommand("notebook.clearAllCellsOutputs", [], { kind: "notebook" });
-    bridgeState.lastMutation = { operation: "cell.clearOutputs", at: new Date().toISOString(), all: true };
+    bridgeState.lastMutation = {
+      operation: "cell.clearOutputs",
+      at: new Date().toISOString(),
+      notebookUri: notebookUri(editor),
+      target: { all: true },
+      all: true,
+      source: "bridge",
+      lastMutationApplied: true,
+      lastMutationObservedAt: new Date().toISOString()
+    };
     return okResponse("cell.clearOutputs", {
       result: { all: true },
       summary: "Cleared outputs for all cells"
-    });
+    }, { includeState: false });
   }
   return withCellSelection(
     editor,
     payload,
     async (target) => {
+      assertReadTokenMatches(target.cell, target.index, payload);
       await executeCommand("notebook.cell.clearOutputs", [], { kind: "notebook" });
-      bridgeState.lastMutation = { operation: "cell.clearOutputs", at: new Date().toISOString(), index: target.index };
+      bridgeState.lastMutation = {
+        operation: "cell.clearOutputs",
+        at: new Date().toISOString(),
+        notebookUri: notebookUri(editor),
+        target: { index: target.index, id: cellId(target.cell) },
+        index: target.index,
+        source: "bridge",
+        lastMutationApplied: true,
+        lastMutationObservedAt: new Date().toISOString()
+      };
       const refreshed = getEditorOrThrow().notebook.cellAt(target.index);
       return okResponse("cell.clearOutputs", {
-        cell: serializeCell(refreshed, target.index),
+        index: target.index,
+        cellId: cellId(refreshed),
+        cell: toBoolean(payload.includeCell, false) ? compactCellSummary(serializeCell(refreshed, target.index)) : undefined,
         summary: `Cleared outputs for cell ${target.index}`
-      });
+      }, { includeState: false });
     },
     { restoreSelection: toBoolean(payload.restoreSelection, false) }
   );
+}
+
+function cloneNotebookValue(value, fallback = {}) {
+  if (value === undefined || value === null) {
+    return Array.isArray(fallback) ? [...fallback] : { ...fallback };
+  }
+  try {
+    return JSON.parse(JSON.stringify(value));
+  } catch {
+    return value;
+  }
+}
+
+function notebookCellStateFromCell(cell) {
+  return {
+    id: cellId(cell) || cell.metadata?.id || null,
+    kind: cell.kind === vscode.NotebookCellKind.Markup ? "markdown" : "code",
+    languageId: cell.document.languageId || notebookLanguage(cell.kind),
+    source: cell.document.getText(),
+    metadata: cloneNotebookValue(cell.metadata || {}),
+    outputs: Array.isArray(cell.outputs) ? cell.outputs.slice() : []
+  };
+}
+
+function cloneNotebookCellState(state) {
+  return {
+    id: state.id || state.metadata?.id || null,
+    kind: state.kind,
+    languageId: state.languageId || notebookLanguage(state.kind),
+    source: normalizeSource(state.source),
+    metadata: cloneNotebookValue(state.metadata || {}),
+    outputs: Array.isArray(state.outputs) ? state.outputs.slice() : []
+  };
+}
+
+function notebookCellDataFromState(state) {
+  const kind = notebookKind(state.kind);
+  const cellData = new vscode.NotebookCellData(kind, normalizeSource(state.source), textValue(state.languageId, notebookLanguage(kind)));
+  cellData.metadata = cloneNotebookValue(state.metadata || {});
+  cellData.outputs = Array.isArray(state.outputs) ? state.outputs.slice() : [];
+  return cellData;
+}
+
+function summarizedStateCell(state, index) {
+  return {
+    index,
+    id: state.id || state.metadata?.id || null,
+    kind: state.kind,
+    languageId: state.languageId || notebookLanguage(state.kind),
+    sourceSummary: normalizeSource(state.source).slice(0, 240),
+    outputSummary: (state.outputs || []).map((output) => summarizeOutput(output)),
+    executionSummary: {
+      executionOrder: null,
+      success: null,
+      timing: null
+    }
+  };
+}
+
+function batchSelectionIndex(editor) {
+  const current = editor && editor.selections && editor.selections[0];
+  return current ? current.start : null;
+}
+
+function findStateCell(states, locator = {}, options = {}) {
+  const selection = textValue(locator.selection);
+  if (selection === "current") {
+    const selectionIndex = options.selectionIndex;
+    if (selectionIndex === null || selectionIndex === undefined) {
+      throw structuredError("NO_SELECTION", "No selected notebook cell");
+    }
+    const cell = states[selectionIndex];
+    if (!cell) {
+      throw structuredError("NO_SELECTION", "Selected notebook cell is out of range");
+    }
+    return { cell, index: selectionIndex };
+  }
+
+  const index = toInteger(locator.index);
+  if (index !== null) {
+    if (index < 0 || index >= states.length) {
+      throw structuredError("CELL_INDEX_OUT_OF_RANGE", `Cell index out of range: ${index}`);
+    }
+    return { cell: states[index], index };
+  }
+
+  const desiredId = locator.id || locator.cellId;
+  if (desiredId) {
+    const matchIndex = states.findIndex((cell) => (cell.id || cell.metadata?.id) === desiredId);
+    if (matchIndex === -1) {
+      throw structuredError("CELL_NOT_FOUND", `Unable to find cell: ${desiredId}`);
+    }
+    return { cell: states[matchIndex], index: matchIndex };
+  }
+
+  const marker = locator.marker;
+  if (marker) {
+    const matches = states
+      .map((cell, cellIndex) => ({ cell, index: cellIndex }))
+      .filter((entry) => normalizeSource(entry.cell.source).includes(marker));
+    if (matches.length === 0) {
+      throw structuredError("CELL_MARKER_NOT_FOUND", `No cell matched marker: ${marker}`);
+    }
+    if (matches.length > 1 && !options.allowMultipleMarkers) {
+      throw structuredError("CELL_MARKER_AMBIGUOUS", `Marker matched multiple cells: ${marker}`);
+    }
+    return matches[0];
+  }
+
+  throw structuredError("CELL_LOCATOR_REQUIRED", "A cell locator is required");
+}
+
+function resolveDeleteIndexesFromState(states, payload, selectionIndex) {
+  const indexes = arrayValue(payload.indexes || payload.indices || payload.index)
+    .map((value) => toInteger(value))
+    .filter((value) => value !== null)
+    .sort((a, b) => a - b);
+  if (indexes.length === 0) {
+    const target = findStateCell(states, payload, { selectionIndex });
+    indexes.push(target.index);
+  }
+  const uniqueIndexes = [...new Set(indexes)];
+  for (const index of uniqueIndexes) {
+    if (index < 0 || index >= states.length) {
+      throw structuredError("CELL_INDEX_OUT_OF_RANGE", `Cell index out of range: ${index}`);
+    }
+  }
+  return uniqueIndexes;
+}
+
+function adjustSelectionAfterDelete(selectionIndex, deletedIndexes, nextLength) {
+  if (selectionIndex === null || selectionIndex === undefined) {
+    return selectionIndex;
+  }
+  if (nextLength === 0) {
+    return null;
+  }
+  const removedBefore = deletedIndexes.filter((index) => index < selectionIndex).length;
+  if (deletedIndexes.includes(selectionIndex)) {
+    const firstDeleted = deletedIndexes[0];
+    return Math.min(firstDeleted - removedBefore, nextLength - 1);
+  }
+  return Math.min(selectionIndex - removedBefore, nextLength - 1);
+}
+
+function compactCellSummary(cell) {
+  if (!cell) {
+    return null;
+  }
+  return {
+    index: cell.index ?? null,
+    id: cell.id ?? null,
+    kind: cell.kind ?? null,
+    languageId: cell.languageId ?? null,
+    sourceSummary: cell.sourceSummary ?? null,
+    outputSummary: cell.outputSummary ?? [],
+    executionSummary: cell.executionSummary || null
+  };
+}
+
+function compactBatchResult(response) {
+  const compact = {
+    operation: response.operation || null,
+    applied: response.applied !== false,
+    identityStable: response.identityStable !== false,
+    summary: response.summary || null
+  };
+  if (response.cell) {
+    compact.cell = compactCellSummary(response.cell);
+    compact.index = compact.cell.index;
+    compact.cellId = compact.cell.id;
+  }
+  if (response.result) {
+    compact.result = response.result;
+  }
+  if (response.selection) {
+    compact.selection = response.selection;
+  }
+  return compact;
+}
+
+function normalizeBatchMode(value) {
+  const mode = textValue(value, "transactional");
+  return ["transactional", "bestEffort"].includes(mode) ? mode : "transactional";
+}
+
+function createBatchInsertState(request, append, states) {
+  const index = append ? states.length : toInteger(request.index, states.length);
+  if (index < 0 || index > states.length) {
+    throw structuredError("CELL_INDEX_OUT_OF_RANGE", `Cell index out of range: ${index}`);
+  }
+  const kind = notebookKind(request.kind) === vscode.NotebookCellKind.Markup ? "markdown" : "code";
+  const metadata = cloneNotebookValue(request.metadata || {});
+  const state = {
+    id: metadata.id || null,
+    kind,
+    languageId: textValue(request.languageId, notebookLanguage(kind)),
+    source: normalizeSource(request.source),
+    metadata,
+    outputs: []
+  };
+  states.splice(index, 0, state);
+  return { state, index };
+}
+
+function applyBatchOperationToState(states, operation, batchState) {
+  const kind = textValue(operation.op || operation.action);
+  const request = { ...operation, noFollow: true };
+  switch (kind) {
+    case "insert":
+    case "append": {
+      const { state, index } = createBatchInsertState(request, kind === "append", states);
+      batchState.mutated = true;
+      return {
+        operation: kind === "append" ? "cell.append" : "cell.insert",
+        applied: true,
+        identityStable: true,
+        cell: summarizedStateCell(state, index),
+        summary: `${kind === "append" ? "Appended" : "Inserted"} cell at ${index}`
+      };
+    }
+    case "update": {
+      const target = findStateCell(states, request, { selectionIndex: batchState.selectionIndex });
+      if (request.readToken || request.expectedReadToken || request.ifMatchReadToken) {
+        const actualToken = [
+          target.cell.id || target.cell.metadata?.id || null,
+          target.index,
+          stableHash(normalizeSource(target.cell.source)),
+          stableHash(target.cell.metadata || {}),
+          (target.cell.outputs || []).length
+        ].join(":");
+        const expectedToken = textValue(request.readToken || request.expectedReadToken || request.ifMatchReadToken);
+        if (expectedToken && expectedToken !== actualToken) {
+          throw structuredError("CELL_STALE_READ", `Cell ${target.index} changed since it was last read`, {
+            index: target.index,
+            cellId: target.cell.id || target.cell.metadata?.id || null,
+            expectedReadToken: expectedToken,
+            actualReadToken: actualToken
+          });
+        }
+      }
+      const nextState = cloneNotebookCellState(target.cell);
+      if (request.kind !== undefined) {
+        nextState.kind = notebookKind(request.kind) === vscode.NotebookCellKind.Markup ? "markdown" : "code";
+      }
+      if (request.source !== undefined) {
+        nextState.source = normalizeSource(request.source);
+      }
+      if (request.metadata !== undefined) {
+        nextState.metadata = cloneNotebookValue(request.metadata || {});
+        nextState.id = nextState.metadata.id || nextState.id || null;
+      }
+      if (request.languageId !== undefined) {
+        nextState.languageId = textValue(request.languageId, nextState.languageId);
+      } else if (request.kind !== undefined && !request.languageId) {
+        nextState.languageId = notebookLanguage(nextState.kind);
+      }
+      states[target.index] = nextState;
+      batchState.mutated = true;
+      return {
+        operation: "cell.update",
+        applied: true,
+        identityStable: true,
+        cell: summarizedStateCell(nextState, target.index),
+        summary: `Updated cell ${target.index}`
+      };
+    }
+    case "delete": {
+      const indexes = resolveDeleteIndexesFromState(states, request, batchState.selectionIndex);
+      for (let i = indexes.length - 1; i >= 0; i -= 1) {
+        states.splice(indexes[i], 1);
+      }
+      batchState.selectionIndex = adjustSelectionAfterDelete(batchState.selectionIndex, indexes, states.length);
+      batchState.mutated = true;
+      return {
+        operation: "cell.delete",
+        applied: true,
+        identityStable: true,
+        result: { deletedIndexes: indexes },
+        summary: `Deleted ${indexes.length} cell(s)`
+      };
+    }
+    case "move": {
+      const target = findStateCell(states, request, { selectionIndex: batchState.selectionIndex });
+      const destinationIndex =
+        request.toIndex !== undefined
+          ? toInteger(request.toIndex)
+          : request.direction === "up"
+            ? target.index - 1
+            : request.direction === "down"
+              ? target.index + 1
+              : null;
+      if (destinationIndex === null || destinationIndex < 0 || destinationIndex >= states.length) {
+        throw structuredError("CELL_INDEX_OUT_OF_RANGE", `Destination index out of range: ${destinationIndex}`);
+      }
+      const [moved] = states.splice(target.index, 1);
+      states.splice(destinationIndex, 0, moved);
+      if (batchState.selectionIndex === target.index) {
+        batchState.selectionIndex = destinationIndex;
+      }
+      batchState.mutated = true;
+      return {
+        operation: "cell.move",
+        applied: true,
+        identityStable: true,
+        result: { from: target.index, to: destinationIndex },
+        summary: `Moved cell ${target.index} to ${destinationIndex}`
+      };
+    }
+    case "duplicate": {
+      const target = findStateCell(states, request, { selectionIndex: batchState.selectionIndex });
+      const insertIndex = toInteger(request.toIndex, target.index + 1);
+      if (insertIndex < 0 || insertIndex > states.length) {
+        throw structuredError("CELL_INDEX_OUT_OF_RANGE", `Cell index out of range: ${insertIndex}`);
+      }
+      const duplicate = cloneNotebookCellState(target.cell);
+      states.splice(insertIndex, 0, duplicate);
+      batchState.mutated = true;
+      return {
+        operation: "cell.duplicate",
+        applied: true,
+        identityStable: true,
+        cell: summarizedStateCell(duplicate, insertIndex),
+        summary: `Duplicated cell ${target.index} to ${insertIndex}`
+      };
+    }
+    case "select": {
+      const target = findStateCell(states, request, { selectionIndex: batchState.selectionIndex });
+      batchState.selectionIndex = target.index;
+      batchState.uiAction = { kind: "select", index: target.index };
+      return {
+        operation: "cell.select",
+        applied: true,
+        identityStable: true,
+        cell: summarizedStateCell(target.cell, target.index),
+        selection: [{ start: target.index, end: target.index + 1 }],
+        summary: `Selected cell ${target.index}`
+      };
+    }
+    case "reveal": {
+      const target = findStateCell(states, request, { selectionIndex: batchState.selectionIndex });
+      batchState.uiAction = { kind: "reveal", index: target.index };
+      return {
+        operation: "cell.reveal",
+        applied: true,
+        identityStable: true,
+        cell: summarizedStateCell(target.cell, target.index),
+        summary: `Revealed cell ${target.index}`
+      };
+    }
+    case "replaceOutputs": {
+      const target = findStateCell(states, request, { selectionIndex: batchState.selectionIndex });
+      target.cell.outputs = buildOutputs(request.outputs || []);
+      batchState.mutated = true;
+      return {
+        operation: "cell.replaceOutputs",
+        applied: true,
+        identityStable: true,
+        cell: summarizedStateCell(target.cell, target.index),
+        summary: `Replaced outputs for cell ${target.index}`
+      };
+    }
+    case "clearOutputs": {
+      if (toBoolean(request.all, false)) {
+        for (const state of states) {
+          state.outputs = [];
+        }
+        batchState.mutated = true;
+        return {
+          operation: "cell.clearOutputs",
+          applied: true,
+          identityStable: true,
+          result: { all: true },
+          summary: "Cleared outputs for all cells"
+        };
+      }
+      const target = findStateCell(states, request, { selectionIndex: batchState.selectionIndex });
+      target.cell.outputs = [];
+      batchState.mutated = true;
+      return {
+        operation: "cell.clearOutputs",
+        applied: true,
+        identityStable: true,
+        cell: summarizedStateCell(target.cell, target.index),
+        summary: `Cleared outputs for cell ${target.index}`
+      };
+    }
+    default:
+      throw structuredError("BATCH_OPERATION_NOT_SUPPORTED", `Unsupported batch operation: ${kind}`);
+  }
+}
+
+async function batchCells(payload) {
+  const operations = arrayValue(payload.operations || payload.ops);
+  if (operations.length === 0) {
+    throw structuredError("BATCH_OPERATIONS_REQUIRED", "Batch operations are required");
+  }
+
+  const editor = getEditorOrThrow();
+  const mode = normalizeBatchMode(payload.mode);
+  const verboseResults = toBoolean(payload.verboseResults, false);
+  const states = getNotebookCells(editor).map((cell) => notebookCellStateFromCell(cell));
+  const batchState = {
+    selectionIndex: batchSelectionIndex(editor),
+    mutated: false,
+    uiAction: null
+  };
+  const results = [];
+  const errors = [];
+
+  for (let i = 0; i < operations.length; i += 1) {
+    const operation = operations[i];
+    try {
+      const result = applyBatchOperationToState(states, operation, batchState);
+      results.push(verboseResults ? result : compactBatchResult(result));
+    } catch (error) {
+      const payloadError = serializeError(error);
+      errors.push({
+        at: i,
+        op: textValue(operation.op || operation.action),
+        error: payloadError.error
+      });
+      if (mode === "transactional") {
+        throw structuredError("BATCH_TRANSACTION_ABORTED", `Batch aborted at operation ${i}`, {
+          mode,
+          failedAt: i,
+          errors
+        });
+      }
+    }
+  }
+
+  if (batchState.mutated) {
+    await applyNotebookCellReplacement(editor, 0, editor.notebook.cellCount, states.map((state) => notebookCellDataFromState(state)));
+  }
+  if (batchState.uiAction && states.length > 0) {
+    const updatedEditor = getEditorOrThrow();
+    if (batchState.uiAction.kind === "select") {
+      await selectCell(updatedEditor, batchState.uiAction.index, {
+        reveal: toBoolean(payload.followFinal, false)
+      });
+    } else if (batchState.uiAction.kind === "reveal") {
+      await revealCellSmoothly(updatedEditor, batchState.uiAction.index, { forceReveal: true });
+    }
+  }
+
+  bridgeState.lastMutation = {
+    operation: "cell.batch",
+    at: new Date().toISOString(),
+    notebookUri: notebookUri(editor),
+    target: {
+      count: operations.length,
+      completedCount: results.length
+    },
+    source: "bridge",
+    lastMutationApplied: batchState.mutated,
+    lastMutationObservedAt: new Date().toISOString()
+  };
+
+  return okResponse("cell.batch", {
+    result: {
+      count: operations.length,
+      completedCount: results.length,
+      failedAt: errors.length > 0 ? errors[0].at : null,
+      mode,
+      partial: mode === "bestEffort" && errors.length > 0
+    },
+    errors,
+    results,
+    summary: `Applied ${results.length}/${operations.length} batch cell operation(s)`
+  }, { includeState: false });
 }
 
 async function runNotebookCommandWithLocator(operation, commandId, payload, options = {}) {
@@ -978,9 +2574,12 @@ async function runNotebookCommandWithLocator(operation, commandId, payload, opti
     return okResponse(operation, {
       accepted: true,
       pendingObservation: true,
+      completionObserved: false,
+      outputObserved: false,
+      identityStable: true,
       selection: activeNotebookInfo(editor).selection,
       summary: `Execution requested with ${commandId}`
-    });
+    }, { includeState: false });
   }
   return withCellSelection(
     editor,
@@ -994,9 +2593,12 @@ async function runNotebookCommandWithLocator(operation, commandId, payload, opti
         cell: serializeCell(target.cell, target.index),
         accepted: true,
         pendingObservation: true,
+        completionObserved: false,
+        outputObserved: false,
+        identityStable: true,
         selection: activeNotebookInfo(editor).selection,
         summary: `Execution requested for cell ${target.index}`
-      });
+      }, { includeState: false });
     },
     { restoreSelection: toBoolean(payload.restoreSelection, false) }
   );
@@ -1009,7 +2611,7 @@ async function debugNotebookCommand(operation, commandId, payload = {}, options 
     return okResponse(operation, {
       debug: debugState(editor),
       summary: `Debug command executed: ${commandId}`
-    });
+    }, { includeState: false });
   }
   return withCellSelection(
     editor,
@@ -1023,7 +2625,7 @@ async function debugNotebookCommand(operation, commandId, payload = {}, options 
         cell: serializeCell(target.cell, target.index),
         debug: debugState(editor),
         summary: `Debug command executed for cell ${target.index}`
-      });
+      }, { includeState: false });
     },
     { restoreSelection: toBoolean(payload.restoreSelection, false) }
   );
@@ -1037,7 +2639,7 @@ async function kernelCommand(operation, commandId, payload = {}, options = {}) {
   return okResponse(operation, {
     result: { command: commandId },
     summary: `Kernel command executed: ${commandId}`
-  });
+  }, { includeState: false });
 }
 
 async function notebookCommand(operation, commandId) {
@@ -1052,21 +2654,174 @@ async function notebookCommand(operation, commandId) {
     await vscode.window.showNotebookDocument(editor.notebook, { preserveFocus: false, preview: false });
     bridgeState.lastNotebookAction = { command: "focus", at: new Date().toISOString() };
   }
-  return okResponse(operation, { summary: `Notebook command executed: ${commandId}` });
+  return okResponse(operation, { summary: `Notebook command executed: ${commandId}` }, { includeState: false });
 }
 
 async function kernelShutdown() {
   throw structuredError("KERNEL_SHUTDOWN_UNSUPPORTED", "VS Code does not expose a supported public command for shutting down the current notebook kernel");
 }
 
+async function workflowUpdateAndRun(body) {
+  const update = await updateCell(body);
+  if (toBoolean(body.clearOutputs, false)) {
+    await clearOutputs(body);
+  }
+  const execution = body.useCurrentSelection
+    ? await runNotebookCommandWithLocator("workflow.updateAndRun", "notebook.cell.execute", body, { useCurrentSelection: true })
+    : await runNotebookCommandWithLocator("workflow.updateAndRun", "notebook.cell.execute", body);
+  const observe = normalizeObserveMode(body.observe);
+  const includeOutput = toBoolean(body.includeOutput, false);
+  let output = null;
+  if (includeOutput) {
+    output = await readOutput(body, { includeState: false });
+  } else if (observe === "outputSummary") {
+    output = await readOutput(body, { summaryOnly: true, includeState: false });
+  }
+  return okResponse("workflow.updateAndRun", {
+    mutation: compactMutationResult(update),
+    execution: compactExecutionResult(execution, observe),
+    output,
+    result: {
+      mutationApplied: update.applied === true,
+      executionAccepted: execution.accepted === true,
+      hasOutputs: output ? output.hasOutputs === true : null,
+      observe,
+      includeOutput
+    },
+    summary: "Updated and executed target cell through bridge"
+  }, { includeState: false });
+}
+
+async function workflowInsertAndRun(body) {
+  const insert = body.append ? await insertCell(body, true) : await insertCell(body, false);
+  const targetIndex = insert.cell.index;
+  if (toBoolean(body.clearOutputs, false)) {
+    await clearOutputs({ index: targetIndex });
+  }
+  const execution = await runNotebookCommandWithLocator("workflow.insertAndRun", "notebook.cell.execute", { index: targetIndex });
+  const observe = normalizeObserveMode(body.observe);
+  const includeOutput = toBoolean(body.includeOutput, false);
+  let output = null;
+  if (includeOutput) {
+    output = await readOutput({ index: targetIndex }, { includeState: false });
+  } else if (observe === "outputSummary") {
+    output = await readOutput({ index: targetIndex }, { summaryOnly: true, includeState: false });
+  }
+  return okResponse("workflow.insertAndRun", {
+    mutation: compactMutationResult(insert),
+    execution: compactExecutionResult(execution, observe),
+    output,
+    result: {
+      insertedIndex: targetIndex,
+      mutationApplied: insert.applied === true,
+      executionAccepted: execution.accepted === true,
+      hasOutputs: output ? output.hasOutputs === true : null,
+      observe,
+      includeOutput
+    },
+    summary: "Inserted and executed target cell through bridge"
+  }, { includeState: false });
+}
+
+function normalizeObserveMode(value) {
+  const mode = textValue(value, "completion");
+  return ["none", "completion", "outputSummary"].includes(mode) ? mode : "completion";
+}
+
+function compactMutationResult(response) {
+  const cell = compactCellSummary(response.cell);
+  return {
+    operation: response.operation || null,
+    applied: response.applied === true,
+    identityStable: response.identityStable !== false,
+    cell: cell,
+    index: cell ? cell.index : null,
+    cellId: cell ? cell.id : null,
+    result: response.result || null,
+    summary: response.summary || null
+  };
+}
+
+function compactExecutionResult(response, observe = "completion") {
+  const cell = compactCellSummary(response.cell);
+  return {
+    operation: response.operation || null,
+    accepted: response.accepted === true,
+    pendingObservation: response.pendingObservation === true,
+    completionObserved: observe === "none" ? null : response.completionObserved === true,
+    outputObserved: observe === "outputSummary" ? response.outputObserved === true : null,
+    identityStable: response.identityStable !== false,
+    index: cell ? cell.index : null,
+    cellId: cell ? cell.id : null,
+    cell: cell,
+    summary: response.summary || null
+  };
+}
+
+async function readOutput(locator, options = {}) {
+  const active = getEditorOrThrow();
+  const target = findCell(active, locator);
+  const summaryOnly = options.summaryOnly === true;
+  const cell = serializeCell(target.cell, target.index, {
+    includeSource: false,
+    includeMetadata: false,
+    includeOutputs: !summaryOnly,
+    outputTextLimit: summaryOnly ? 300 : 4000
+  });
+  const runtime = activeRuntime(active);
+  const hasOutputs = Array.isArray(target.cell.outputs) && target.cell.outputs.length > 0;
+  const outputSummary = cellOutputSummary(target.cell);
+  const hasError = cellHasErrorOutput(target.cell);
+  const inferred = inferredExecutionObservation(active);
+  const observedFromBridgeExecution = Boolean(
+    bridgeState.lastExecution &&
+    bridgeState.lastExecution.notebookUri === notebookUri(active) &&
+    inferred.outputObserved &&
+    (!runtime || runtime.lastObservedCellIds.length === 0 || runtime.lastObservedCellIds.includes(cell.id))
+  );
+  const payload = {
+    cell,
+    hasOutputs,
+    hasError,
+    outputSummary,
+    observedFromBridgeExecution,
+    summary: `Collected outputs for cell ${target.index}`
+  };
+  if (summaryOnly) {
+    delete payload.cell.outputs;
+    return okResponse("output.summary", payload, {
+      includeState: options.includeState !== false ? true : false
+    });
+  }
+  return okResponse("output", payload, {
+    includeState: options.includeState !== false ? true : false
+  });
+}
+
 async function httpGet(url) {
   const editor = activeNotebookEditor();
   switch (url.pathname) {
+    case "/status/brief":
+      return okResponse("status.brief", {
+        notebook: activeNotebookInfo(editor),
+        window: windowIdentity(),
+        server: {
+          host: bridgeState.server.host || getServerConfig().host,
+          port: bridgeState.server.port || getServerConfig().port,
+          basePort: getServerConfig().port,
+          portSpan: getServerConfig().portSpan,
+          baseUrl: currentServerBaseUrl()
+        },
+        status: briefState(editor),
+        summary: "Collected brief bridge status"
+      }, { includeState: false });
     case "/status":
       return okResponse("status", {
         server: {
-          host: getServerConfig().host,
-          port: getServerConfig().port,
+          host: bridgeState.server.host || getServerConfig().host,
+          port: bridgeState.server.port || getServerConfig().port,
+          basePort: getServerConfig().port,
+          portSpan: getServerConfig().portSpan,
           allowArbitraryCommands: getServerConfig().allowArbitraryCommands
         },
         commands: QUICK_COMMANDS,
@@ -1074,12 +2829,19 @@ async function httpGet(url) {
         execution: executionState(editor),
         debug: debugState(editor)
       });
+    case "/servers":
+      return okResponse("servers", {
+        servers: await discoverLocalServers(),
+        summary: "Collected local bridge server list"
+      });
     case "/commands": {
       const includeAll = url.searchParams.get("all") === "1";
       return okResponse("commands", { commands: includeAll ? await getAllCommands() : QUICK_COMMANDS });
     }
     case "/capabilities":
       return okResponse("capabilities", capabilities());
+    case "/compliance":
+      return okResponse("compliance", { compliance: complianceState(editor) });
     case "/notebook": {
       const active = getEditorOrThrow();
       return okResponse("notebook", summarizeNotebook(active, {
@@ -1094,8 +2856,8 @@ async function httpGet(url) {
       const active = getEditorOrThrow();
       return okResponse("cells", {
         cells: getNotebookCells(active).map((cell, index) => serializeCell(cell, index, {
-          includeSource: toBoolean(url.searchParams.get("includeSource"), true),
-          includeMetadata: toBoolean(url.searchParams.get("includeMetadata"), true),
+          includeSource: toBoolean(url.searchParams.get("includeSource"), false),
+          includeMetadata: toBoolean(url.searchParams.get("includeMetadata"), false),
           includeOutputs: toBoolean(url.searchParams.get("includeOutputs"), false)
         }))
       });
@@ -1108,9 +2870,9 @@ async function httpGet(url) {
         marker: url.searchParams.get("marker"),
         selection: url.searchParams.get("selection")
       }, {
-        includeSource: toBoolean(url.searchParams.get("includeSource"), true),
-        includeMetadata: toBoolean(url.searchParams.get("includeMetadata"), true),
-        includeOutputs: toBoolean(url.searchParams.get("includeOutputs"), true)
+        includeSource: toBoolean(url.searchParams.get("includeSource"), false),
+        includeMetadata: toBoolean(url.searchParams.get("includeMetadata"), false),
+        includeOutputs: toBoolean(url.searchParams.get("includeOutputs"), false)
       });
     case "/context": {
       const active = getEditorOrThrow();
@@ -1118,10 +2880,12 @@ async function httpGet(url) {
         context: {
           notebook: activeNotebookInfo(active),
           kernel: kernelState(active),
+          mutation: mutationState(active),
           execution: executionState(active),
+          compliance: complianceState(active),
           cells: getNotebookCells(active).map((cell, index) => serializeCell(cell, index, {
-            includeSource: toBoolean(url.searchParams.get("includeSource"), true),
-            includeMetadata: toBoolean(url.searchParams.get("includeMetadata"), true),
+            includeSource: toBoolean(url.searchParams.get("includeSource"), false),
+            includeMetadata: toBoolean(url.searchParams.get("includeMetadata"), false),
             includeOutputs: toBoolean(url.searchParams.get("includeOutputs"), false),
             outputTextLimit: 300
           }))
@@ -1132,23 +2896,21 @@ async function httpGet(url) {
     case "/kernel":
     case "/kernel/state":
       return okResponse("kernel.state", { kernel: kernelState(editor) });
-    case "/output": {
-      const active = getEditorOrThrow();
-      const target = findCell(active, {
+    case "/output/summary":
+      return readOutput({
         index: url.searchParams.get("index"),
         cellId: url.searchParams.get("cellId"),
         id: url.searchParams.get("id"),
         marker: url.searchParams.get("marker"),
         selection: url.searchParams.get("selection")
-      });
-      return okResponse("output", {
-        cell: serializeCell(target.cell, target.index, {
-          includeSource: false,
-          includeMetadata: false,
-          includeOutputs: true,
-          outputTextLimit: 4000
-        }),
-        summary: `Collected outputs for cell ${target.index}`
+      }, { summaryOnly: true, includeState: false });
+    case "/output": {
+      return readOutput({
+        index: url.searchParams.get("index"),
+        cellId: url.searchParams.get("cellId"),
+        id: url.searchParams.get("id"),
+        marker: url.searchParams.get("marker"),
+        selection: url.searchParams.get("selection")
       });
     }
     case "/execution/state":
@@ -1198,6 +2960,12 @@ async function httpPost(url, body) {
     case "/cell/clearOutputs":
     case "/output/clear":
       return clearOutputs(body);
+    case "/cell/batch":
+      return batchCells(body);
+    case "/workflow/updateAndRun":
+      return workflowUpdateAndRun(body);
+    case "/workflow/insertAndRun":
+      return workflowInsertAndRun(body);
     case "/run/current":
       return runNotebookCommandWithLocator("run.current", "notebook.cell.execute", body, { useCurrentSelection: true });
     case "/run/cell":
@@ -1208,7 +2976,14 @@ async function httpPost(url, body) {
       return runNotebookCommandWithLocator("run.below", "notebook.cell.executeCellAndBelow", body);
     case "/run/all":
       await executeCommand("notebook.execute", [], { kind: "execution", target: { scope: "all" } });
-      return okResponse("run.all", { accepted: true, pendingObservation: true, summary: "Execution requested for entire notebook" });
+      return okResponse("run.all", {
+        accepted: true,
+        pendingObservation: true,
+        completionObserved: false,
+        outputObserved: false,
+        identityStable: true,
+        summary: "Execution requested for entire notebook"
+      }, { includeState: false });
     case "/run/selectedAndAdvance":
       return runNotebookCommandWithLocator("run.selectedAndAdvance", "notebook.cell.executeAndSelectBelow", body, {
         useCurrentSelection: toBoolean(body.useCurrentSelection, false)
@@ -1221,13 +2996,13 @@ async function httpPost(url, body) {
       return debugNotebookCommand("debug.cell", "jupyter.debugcell", body);
     case "/debug/continue":
       await executeCommand("jupyter.debugcontinue", [], { kind: "debug" });
-      return okResponse("debug.continue", { debug: debugState(), summary: "Debug continue requested" });
+      return okResponse("debug.continue", { debug: debugState(), summary: "Debug continue requested" }, { includeState: false });
     case "/debug/stepOver":
       await executeCommand("jupyter.debugstepover", [], { kind: "debug" });
-      return okResponse("debug.stepOver", { debug: debugState(), summary: "Debug step-over requested" });
+      return okResponse("debug.stepOver", { debug: debugState(), summary: "Debug step-over requested" }, { includeState: false });
     case "/debug/stop":
       await executeCommand("jupyter.debugstop", [], { kind: "debug" });
-      return okResponse("debug.stop", { debug: debugState(), summary: "Debug stop requested" });
+      return okResponse("debug.stop", { debug: debugState(), summary: "Debug stop requested" }, { includeState: false });
     case "/kernel/interrupt":
       return kernelCommand("kernel.interrupt", "jupyter.interruptkernel", body);
     case "/kernel/restart":
@@ -1240,7 +3015,7 @@ async function httpPost(url, body) {
       return kernelShutdown();
     case "/kernel/select":
       await executeCommand("notebook.selectKernel", [], { kind: "kernel" });
-      return okResponse("kernel.select", { summary: "Kernel picker opened" });
+      return okResponse("kernel.select", { summary: "Kernel picker opened" }, { includeState: false });
     case "/notebook/save":
       return notebookCommand("notebook.save", "save");
     case "/notebook/revert":
@@ -1251,16 +3026,16 @@ async function httpPost(url, body) {
       return notebookCommand("notebook.focus", "focus");
     case "/viewer/variables/open":
       await executeCommand("jupyter.openVariableView", [], { kind: "notebook" });
-      return okResponse("viewer.variables.open", { summary: "Variable view opened" });
+      return okResponse("viewer.variables.open", { summary: "Variable view opened" }, { includeState: false });
     case "/viewer/data/open":
       await executeCommand("jupyter.showDataViewer", [], { kind: "notebook" });
-      return okResponse("viewer.data.open", { summary: "Data Viewer command invoked" });
+      return okResponse("viewer.data.open", { summary: "Data Viewer command invoked" }, { includeState: false });
     case "/viewer/output/open":
       await executeCommand("jupyter.viewOutput", [], { kind: "notebook" });
-      return okResponse("viewer.output.open", { summary: "Jupyter output panel opened" });
+      return okResponse("viewer.output.open", { summary: "Jupyter output panel opened" }, { includeState: false });
     case "/interpreter/select":
       await executeCommand("jupyter.selectJupyterInterpreter", [], { kind: "notebook" });
-      return okResponse("interpreter.select", { summary: "Interpreter picker opened" });
+      return okResponse("interpreter.select", { summary: "Interpreter picker opened" }, { includeState: false });
     default:
       throw structuredError("NOT_FOUND", `Unknown POST route: ${url.pathname}`);
   }
@@ -1268,6 +3043,7 @@ async function httpPost(url, body) {
 
 async function startServer() {
   if (bridgeServer) {
+    refreshControlCenterSoon(0);
     return;
   }
   const config = getServerConfig();
@@ -1309,19 +3085,52 @@ async function startServer() {
     }
   });
 
-  await new Promise((resolve, reject) => {
-    bridgeServer.once("error", reject);
-    bridgeServer.listen(config.port, config.host, () => {
-      bridgeServer.off("error", reject);
-      resolve();
-    });
-  });
+  const candidatePorts = Array.from({ length: Math.max(config.portSpan || 1, 1) }, (_, index) => config.port + index);
+  let boundPort = null;
+  let lastError = null;
 
-  log(`Server started at http://${config.host}:${config.port}`);
+  for (const port of candidatePorts) {
+    try {
+      await new Promise((resolve, reject) => {
+        const onError = (error) => {
+          bridgeServer.off("error", onError);
+          reject(error);
+        };
+        bridgeServer.once("error", onError);
+        bridgeServer.listen(port, config.host, () => {
+          bridgeServer.off("error", onError);
+          resolve();
+        });
+      });
+      boundPort = port;
+      break;
+    } catch (error) {
+      lastError = error;
+      if (error.code !== "EADDRINUSE") {
+        throw error;
+      }
+    }
+  }
+
+  if (boundPort === null) {
+    throw lastError || new Error("Unable to bind any bridge port");
+  }
+
+  bridgeState.server = {
+    host: config.host,
+    port: boundPort,
+    basePort: config.port,
+    portSpan: config.portSpan,
+    startedAt: new Date().toISOString()
+  };
+
+  log(`Server started at http://${config.host}:${boundPort} for ${JSON.stringify(windowIdentity())}`);
+  refreshControlCenterSoon(0);
 }
 
 async function stopServer() {
   if (!bridgeServer) {
+    refreshControlCenterSoon(0);
     return;
   }
   const server = bridgeServer;
@@ -1335,27 +3144,39 @@ async function stopServer() {
       resolve();
     });
   });
+  bridgeState.server = {
+    host: null,
+    port: null,
+    basePort: null,
+    portSpan: null,
+    startedAt: null
+  };
   log("Server stopped");
+  refreshControlCenterSoon(0);
 }
 
 function showStatus() {
-  const config = getServerConfig();
+  const host = bridgeState.server.host || getServerConfig().host;
+  const port = bridgeState.server.port || getServerConfig().port;
   const notebook = activeNotebookInfo();
   const serverRunning = Boolean(bridgeServer);
   vscode.window.showInformationMessage(
-    `Data Bridge ${serverRunning ? "running" : "stopped"} on http://${config.host}:${config.port} | Active notebook: ${notebook.hasActiveNotebook ? "yes" : "no"}`
+    `Data Bridge ${serverRunning ? (localeBundle() === I18N.zh ? "运行中" : "running") : (localeBundle() === I18N.zh ? "已停止" : "stopped")} on http://${host}:${port} | ${localeBundle() === I18N.zh ? "活动笔记本" : "Active notebook"}: ${notebook.hasActiveNotebook ? t("yes") : t("no")}`
   );
   output.show(true);
 }
 
 async function copyServerConfig() {
-  const config = getServerConfig();
+  const host = bridgeState.server.host || getServerConfig().host;
+  const port = bridgeState.server.port || getServerConfig().port;
   await vscode.env.clipboard.writeText(JSON.stringify({
-    baseUrl: `http://${config.host}:${config.port}`,
-    token: config.token || null,
-    endpoints: DEFAULT_ENDPOINTS
+    baseUrl: `http://${host}:${port}`,
+    token: getServerConfig().token || null,
+    endpoints: DEFAULT_ENDPOINTS,
+    window: windowIdentity()
   }, null, 2));
-  vscode.window.showInformationMessage("Data Bridge config copied to clipboard.");
+  vscode.window.showInformationMessage(localeBundle() === I18N.zh ? "Data Bridge 配置已复制到剪贴板。" : "Data Bridge config copied to clipboard.");
+  refreshControlCenterSoon(0);
 }
 
 async function runNotebookCommand() {
