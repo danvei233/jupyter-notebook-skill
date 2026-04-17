@@ -117,6 +117,7 @@ Read [references/plotting-style.md](references/plotting-style.md) for the reusab
 - When the notebook kernel is available, do not shell-run the same sklearn or analysis code that the notebook is about to run. Only use shell-side Python as an explicit diagnostic path when bridge-backed execution is unclear or the user asks for it.
 - Prefer `bridge_post_cell_batch` for stage scaffolding and `bridge_post_workflow_*` for mutation + targeted execution.
 - Prefer `bridge_get_output_summary` over full output reads unless the next step truly depends on full payload details.
+- When a single blocking call is simpler than a separate await/read cycle, prefer `block=true` with `timeoutMs` on `bridge_post_run_*` or `bridge_post_workflow_*` instead of external sleep loops.
 - Before mutating an existing cell, read that cell once and carry its `readToken` into the mutation call.
 - If a mutation fails with a stale-read error, re-read the cell and regenerate from the fresh source instead of retrying blindly.
 - Treat `bridge_post_cell_batch` as a stage tool, not a whole-notebook dump. Default to 2-4 closely related cells per batch unless the user explicitly asks for a larger structural operation.

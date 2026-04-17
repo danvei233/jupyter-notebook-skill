@@ -188,11 +188,11 @@ Important MCP tools:
 - `bridge_post_cell_update`
   Use for one existing-cell edit with stale-read protection.
 - `bridge_post_workflow_update_and_run`
-  Use when a known existing cell should be updated and executed in one compact step. Read the cell first, pass its `readToken`, and then inspect `bridge_get_execution_state` or `bridge_get_output_summary` as needed.
+  Use when a known existing cell should be updated and executed in one compact step. Read the cell first, pass its `readToken`, and then inspect `bridge_get_execution_state` or `bridge_get_output_summary` as needed. If a single blocking call is simpler, pass `block=true` with `timeoutMs`.
 - `bridge_post_workflow_insert_and_run`
-  Use when a new cell should be inserted and immediately executed. The default response stays compact and returns an execution ticket; await or read output only when needed.
+  Use when a new cell should be inserted and immediately executed. The default response stays compact and returns an execution ticket; await or read output only when needed. If a single blocking call is simpler, pass `block=true` with `timeoutMs`.
 - `bridge_post_run_cell`
-  Use for targeted execution once notebook identity and cell targeting are already clear.
+  Use for targeted execution once notebook identity and cell targeting are already clear. Pass `block=true` with `timeoutMs` when you want the tool to wait rather than chaining a separate execution-state call.
 
 Practical MCP usage rules:
 

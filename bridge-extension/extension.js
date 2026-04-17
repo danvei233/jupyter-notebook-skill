@@ -3077,16 +3077,26 @@ async function batchCells(payload) {
 
 async function runNotebookCommandWithLocator(operation, commandId, payload, options = {}) {
   const editor = getEditorOrThrow();
+  const block = toBoolean(payload && payload.block, false);
+  const timeoutMs = payload && payload.timeoutMs !== undefined ? Math.max(toInteger(payload.timeoutMs, 0), 0) : 0;
+  const waitFor = payload && payload.waitFor !== undefined ? normalizeWaitFor(payload.waitFor) : "output";
   if (options.useCurrentSelection) {
     await executeCommand(commandId, [], { kind: "execution", target: { selection: "current" } });
     const execution = bridgeState.lastExecution;
+    let observed = null;
+    if (block && execution && execution.operationId) {
+      observed = await awaitExecutionState(execution.operationId, waitFor, timeoutMs);
+    }
     return okResponse(operation, {
       operationId: execution ? execution.operationId : null,
       accepted: true,
-      pendingObservation: true,
-      completionObserved: false,
-      outputObserved: false,
+      pendingObservation: observed ? observed.pendingObservation === true : true,
+      completionObserved: observed ? observed.completionObserved === true : false,
+      outputObserved: observed ? observed.outputObserved === true : false,
       identityStable: true,
+      status: observed ? observed.status || null : null,
+      waitTimedOut: observed ? observed.waitTimedOut === true : false,
+      waitedMs: observed ? observed.waitedMs || 0 : 0,
       selection: activeNotebookInfo(editor).selection,
       summary: `Execution requested with ${commandId}`
     }, { includeState: false });
@@ -3100,6 +3110,10 @@ async function runNotebookCommandWithLocator(operation, commandId, payload, opti
         target: { index: target.index, id: cellId(target.cell) }
       });
       const execution = bridgeState.lastExecution;
+      let observed = null;
+      if (block && execution && execution.operationId) {
+        observed = await awaitExecutionState(execution.operationId, waitFor, timeoutMs);
+      }
       return okResponse(operation, {
         operationId: execution ? execution.operationId : null,
         cell: compactCellSummary(serializeCell(target.cell, target.index, {
@@ -3108,10 +3122,13 @@ async function runNotebookCommandWithLocator(operation, commandId, payload, opti
           includeOutputs: false
         })),
         accepted: true,
-        pendingObservation: true,
-        completionObserved: false,
-        outputObserved: false,
+        pendingObservation: observed ? observed.pendingObservation === true : true,
+        completionObserved: observed ? observed.completionObserved === true : false,
+        outputObserved: observed ? observed.outputObserved === true : false,
         identityStable: true,
+        status: observed ? observed.status || null : null,
+        waitTimedOut: observed ? observed.waitTimedOut === true : false,
+        waitedMs: observed ? observed.waitedMs || 0 : 0,
         selection: activeNotebookInfo(editor).selection,
         summary: `Execution requested for cell ${target.index}`
       }, { includeState: false });
@@ -3152,6 +3169,9 @@ async function debugNotebookCommand(operation, commandId, payload = {}, options 
 }
 
 async function kernelCommand(operation, commandId, payload = {}, options = {}) {
+  const block = toBoolean(payload && payload.block, false);
+  const timeoutMs = payload && payload.timeoutMs !== undefined ? Math.max(toInteger(payload.timeoutMs, 0), 0) : 0;
+  const waitFor = payload && payload.waitFor !== undefined ? normalizeWaitFor(payload.waitFor) : "stable";
   if (options.useLocator) {
     return withCellSelection(
       getEditorOrThrow(),
@@ -3161,11 +3181,18 @@ async function kernelCommand(operation, commandId, payload = {}, options = {}) {
           kind: "kernel",
           target: { index: target.index, id: cellId(target.cell) }
         });
+        let observed = null;
+        if (block && kernelOperation.operationId) {
+          observed = await awaitExecutionState(kernelOperation.operationId, waitFor, timeoutMs);
+        }
         return okResponse(operation, {
           operationId: kernelOperation.operationId,
           submitted: kernelOperation.submitted,
-          acknowledged: kernelOperation.acknowledged,
-          timeoutState: kernelOperation.timeoutState,
+          acknowledged: observed ? observed.acknowledged === true : kernelOperation.acknowledged,
+          timeoutState: observed ? observed.timeoutState || kernelOperation.timeoutState : kernelOperation.timeoutState,
+          status: observed ? observed.status || null : null,
+          waitTimedOut: observed ? observed.waitTimedOut === true : false,
+          waitedMs: observed ? observed.waitedMs || 0 : 0,
           cell: compactCellSummary(serializeCell(target.cell, target.index, {
             includeSource: false,
             includeMetadata: false,
@@ -3178,12 +3205,19 @@ async function kernelCommand(operation, commandId, payload = {}, options = {}) {
     );
   }
   const kernelOperation = dispatchCommand(commandId, [], { kind: "kernel", target: payload || null });
+  let observed = null;
+  if (block && kernelOperation.operationId) {
+    observed = await awaitExecutionState(kernelOperation.operationId, waitFor, timeoutMs);
+  }
   return okResponse(operation, {
     operationId: kernelOperation.operationId,
     submitted: kernelOperation.submitted,
-    acknowledged: kernelOperation.acknowledged,
-    timeoutState: kernelOperation.timeoutState,
-    result: { command: commandId, submitted: kernelOperation.submitted, acknowledged: kernelOperation.acknowledged },
+    acknowledged: observed ? observed.acknowledged === true : kernelOperation.acknowledged,
+    timeoutState: observed ? observed.timeoutState || kernelOperation.timeoutState : kernelOperation.timeoutState,
+    status: observed ? observed.status || null : null,
+    waitTimedOut: observed ? observed.waitTimedOut === true : false,
+    waitedMs: observed ? observed.waitedMs || 0 : 0,
+    result: { command: commandId, submitted: kernelOperation.submitted, acknowledged: observed ? observed.acknowledged === true : kernelOperation.acknowledged },
     summary: `Kernel command submitted: ${commandId}`
   }, { includeState: false });
 }
@@ -3217,10 +3251,15 @@ async function workflowUpdateAndRun(body) {
     : await runNotebookCommandWithLocator("workflow.updateAndRun", "notebook.cell.execute", body);
   const observe = normalizeObserveMode(body.observe);
   const includeOutput = toBoolean(body.includeOutput, false);
+  const block = toBoolean(body.block, false);
   const operationId = execution.operationId || null;
   let output = null;
-  if (observe !== "none") {
-    await awaitExecutionState(operationId, observe === "outputSummary" || includeOutput ? "output" : "completion", toInteger(body.timeoutMs, 3000));
+  let observed = null;
+  if (observe !== "none" || block) {
+    const waitMode = body.waitFor !== undefined
+      ? normalizeWaitFor(body.waitFor)
+      : (observe === "outputSummary" || includeOutput || block ? "output" : "completion");
+    observed = await awaitExecutionState(operationId, waitMode, body.timeoutMs !== undefined ? toInteger(body.timeoutMs, 0) : 0);
   }
   if (includeOutput) {
     output = await readOutput({ ...body, operationId }, { includeState: false, operationId });
@@ -3235,6 +3274,7 @@ async function workflowUpdateAndRun(body) {
       mutationApplied: update.applied === true,
       executionAccepted: execution.accepted === true,
       hasOutputs: output ? output.hasOutputs === true : null,
+      waitTimedOut: observed ? observed.waitTimedOut === true : false,
       observe,
       includeOutput
     },
@@ -3251,10 +3291,15 @@ async function workflowInsertAndRun(body) {
   const execution = await runNotebookCommandWithLocator("workflow.insertAndRun", "notebook.cell.execute", { index: targetIndex });
   const observe = normalizeObserveMode(body.observe);
   const includeOutput = toBoolean(body.includeOutput, false);
+  const block = toBoolean(body.block, false);
   const operationId = execution.operationId || null;
   let output = null;
-  if (observe !== "none") {
-    await awaitExecutionState(operationId, observe === "outputSummary" || includeOutput ? "output" : "completion", toInteger(body.timeoutMs, 3000));
+  let observed = null;
+  if (observe !== "none" || block) {
+    const waitMode = body.waitFor !== undefined
+      ? normalizeWaitFor(body.waitFor)
+      : (observe === "outputSummary" || includeOutput || block ? "output" : "completion");
+    observed = await awaitExecutionState(operationId, waitMode, body.timeoutMs !== undefined ? toInteger(body.timeoutMs, 0) : 0);
   }
   if (includeOutput) {
     output = await readOutput({ index: targetIndex, operationId }, { includeState: false, operationId });
@@ -3270,6 +3315,7 @@ async function workflowInsertAndRun(body) {
       mutationApplied: insert.applied === true,
       executionAccepted: execution.accepted === true,
       hasOutputs: output ? output.hasOutputs === true : null,
+      waitTimedOut: observed ? observed.waitTimedOut === true : false,
       observe,
       includeOutput
     },

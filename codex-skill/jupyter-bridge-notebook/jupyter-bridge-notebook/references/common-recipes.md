@@ -110,6 +110,7 @@ For raw CLI examples, use the diagnostics appendix instead of teaching them in t
 6. If `completionObserved=false` or `outputObserved=false`, diagnose the bridge path first instead of switching to `nbclient` or a Python writeback flow
 7. Prefer `bridge_get_execution_state` with `waitFor=completion|output|stable` plus `timeoutMs` for long-running work; `idle` is only a legacy alias of `stable`
 8. Do not hand-roll fixed-interval sleep loops when `waitFor` can express the real stopping condition
+9. If one blocking call is simpler than a separate await/read cycle, pass `block=true` with `timeoutMs` directly to `bridge_post_run_cell` or `bridge_post_run_current`
 
 ## Final Full Pass
 
@@ -124,6 +125,7 @@ For raw CLI examples, use the diagnostics appendix instead of teaching them in t
 3. Use `bridge_post_workflow_update_and_run` with that `readToken`
 4. Default to `observe: "outputSummary"` only when the next step depends on the result
 5. Leave `includeOutput` false unless you truly need the full output payload
+6. If you want the workflow call itself to wait, pass `block=true` with `timeoutMs`; otherwise keep it non-blocking and inspect execution/output separately
 6. Confirm `mutationApplied`, `executionAccepted`, and, when requested, `hasOutputs`
 
 ## Insert And Run In One Step
