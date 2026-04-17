@@ -37,6 +37,15 @@ Do not use them as notebook-task preflight.
 5. If MCP is unavailable, use the diagnostics appendix and the equivalent CLI fallback read
 6. Do not follow this with `bridge_get_compliance` or `bridge_get_context` unless something is actually ambiguous
 
+## Open or Switch Notebook In Current Window
+
+1. If the user names a specific notebook and interactive work is required, open it with `bridge_post_notebook_open`
+2. Prefer `path` for a local workspace file; use `createIfMissing=true` only when creating a new notebook is part of the task
+3. After opening, re-read `bridge_get_status_brief` and confirm the active notebook `uri` now matches the intended file
+4. If switching notebooks would disrupt the user's current window context, do not do it silently
+5. If the notebook appears to belong to a different VS Code window and the user has not explicitly allowed disruption, stop and ask them to open it in the Codex window instead
+6. Only if the user clearly permits it, use `bridge_post_notebook_close_editor` / `bridge_post_notebook_open` to replace the current notebook in the Codex window
+
 ## Select a Bridge Server
 
 1. Call `bridge_list_servers` when multiple VS Code windows or notebooks may be open

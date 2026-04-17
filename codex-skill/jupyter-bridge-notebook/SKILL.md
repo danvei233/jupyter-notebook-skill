@@ -25,6 +25,9 @@ Execution priority:
 - If temporary JSON request bodies are needed for `bridgectl -body-file`, store them under `./tmp/bridgebody/` in the current working directory, not in the project root.
 - For multi-line source, long markdown, or larger JSON payloads, default to `bridgectl -body-file` instead of inline `-body`.
 - Treat the capability manifest as the truth source. If docs and behavior disagree, verify against the manifest-backed MCP tool set or the current bridge responses.
+- If the user mentions `.ipynb`, `notebook`, notebook cells, notebook outputs, charts in a notebook, or asks to "new/create/build" a notebook, use this skill by default unless the user explicitly asks for a static file-only template.
+- Do not treat "create a new ipynb" as an automatic file-only exemption. If the user also wants execution, outputs, figures, or interactive notebook behavior, stay on the bridge/MCP path.
+- The bridge operates on the current active notebook editor. If the intended notebook is not active, do not silently continue with interactive cell work against some other file.
 
 ## Workflow Modes
 
@@ -60,6 +63,13 @@ For normal work:
 1. `bridge_get_status_brief`
 2. confirm active notebook `uri`, `identity.versionToken`, selection, and cell count
 3. mutate or run with the smallest safe bridge call
+
+For newly requested notebooks:
+
+1. decide whether the request is interactive or file-only
+2. if the user wants execution, outputs, charts, or live notebook behavior, require an active notebook editor before claiming interactive progress
+3. if the intended new notebook is not active and no notebook-open tool is available, pause and tell the user to open that notebook in the same VS Code window
+4. only use file-only generation when the user explicitly wants a static template or offline artifact
 
 Only escalate when risk is real:
 
@@ -102,6 +112,7 @@ Read [references/plotting-style.md](references/plotting-style.md) for the reusab
 - MCP-first light state: `bridge_get_status_brief`, `bridge_get_output_summary`
 - MCP-first full state: `bridge_get_status`, `bridge_get_compliance`, `bridge_get_context`, `bridge_get_output`
 - MCP-first server binding: `bridge_list_servers`, `bridge_get_active_server`, `bridge_set_active_server`, `bridge_clear_active_server`
+- Notebook page lifecycle: `bridge_post_notebook_open`, `bridge_post_notebook_focus`, `bridge_post_notebook_close_editor`, `bridge_post_notebook_save`, `bridge_post_notebook_revert`
 - CLI fallback: diagnostics appendix only
 - Edit cells: `bridge_post_cell_insert`, `bridge_post_cell_append`, `bridge_post_cell_update`, `bridge_post_cell_move`, `bridge_post_cell_delete`, `bridge_post_cell_batch`
 - Atomic workflows: `bridge_post_workflow_update_and_run`, `bridge_post_workflow_insert_and_run`
@@ -135,14 +146,23 @@ Read [references/diagnostics.md](references/diagnostics.md) only for low-level f
 - If bridge mutation or execution fails, diagnose bridge first. Do not switch paths silently.
 - `kernel/shutdown` is currently unsupported.
 
+## Cross-Window Rule
+
+- If the intended notebook is not in the Codex window, do not silently continue interactive bridge work against another file.
+- If the user explicitly authorizes disruption, you may replace the current notebook in the Codex window by opening the intended notebook there and, if needed, closing the current editor in that same window.
+- Do not claim you closed a notebook in a different VS Code window unless a tool actually supports and confirms that action.
+- Without explicit user permission to disrupt the current notebook page, stop instead of force-switching windows or editors.
+
 ## Do Not Overuse Heavy Mode
 
 Prefer `blank` mode or file-only notebook generation when:
 
 - the user only wants a static `.ipynb` template
 - the task is mainly markdown restructuring or title cleanup
-- the target is not the active notebook
+- the target is not the active notebook and the user explicitly does not need live execution
 - live kernel state and live outputs are irrelevant
+
+If the user asks for a new notebook plus execution or visual results, this is not a file-only case. The notebook must become the active editor before interactive bridge work can proceed safely.
 
 Do not mix control-center polling into normal notebook execution work unless the user explicitly wants server or UI status.
 

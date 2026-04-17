@@ -1,6 +1,7 @@
 "use strict";
 
 const http = require("http");
+const path = require("path");
 const vscode = require("vscode");
 
 const QUICK_COMMANDS = [
@@ -83,6 +84,7 @@ const DEFAULT_ENDPOINTS = [
   "POST /kernel/restartAndRunToCell",
   "POST /kernel/shutdown",
   "POST /kernel/select",
+  "POST /notebook/open",
   "POST /notebook/save",
   "POST /notebook/revert",
   "POST /notebook/closeEditor",
@@ -1720,6 +1722,46 @@ function getEditorOrThrow() {
   return editor;
 }
 
+function currentWorkspaceRootPath() {
+  const roots = windowIdentity().rootPaths || [];
+  return roots.length > 0 ? roots[0] : null;
+}
+
+function notebookUriFromPayload(payload = {}) {
+  const explicitUri = textValue(payload.uri);
+  if (explicitUri) {
+    try {
+      return vscode.Uri.parse(explicitUri);
+    } catch {
+      throw structuredError("INVALID_NOTEBOOK_URI", `Invalid notebook uri: ${explicitUri}`);
+    }
+  }
+
+  const requestedPath = textValue(payload.path || payload.file || payload.notebookPath);
+  if (!requestedPath) {
+    throw structuredError("NOTEBOOK_PATH_REQUIRED", "Notebook path or uri is required");
+  }
+
+  let resolvedPath = requestedPath;
+  if (!/^[a-zA-Z]:[\\/]/.test(requestedPath) && !requestedPath.startsWith("/") && !requestedPath.startsWith("\\")) {
+    const root = currentWorkspaceRootPath();
+    if (!root) {
+      throw structuredError("WORKSPACE_ROOT_REQUIRED", "A workspace root is required to resolve a relative notebook path");
+    }
+    resolvedPath = vscode.Uri.joinPath(vscode.Uri.file(root), requestedPath).fsPath;
+  }
+  return vscode.Uri.file(resolvedPath);
+}
+
+function emptyNotebookBytes() {
+  return Buffer.from(JSON.stringify({
+    cells: [],
+    metadata: {},
+    nbformat: 4,
+    nbformat_minor: 5
+  }, null, 2), "utf8");
+}
+
 function getNotebookCells(editor) {
   return editor.notebook.getCells();
 }
@@ -3237,6 +3279,50 @@ async function notebookCommand(operation, commandId) {
   return okResponse(operation, { summary: `Notebook command executed: ${commandId}` }, { includeState: false });
 }
 
+async function openNotebook(body = {}) {
+  const uri = notebookUriFromPayload(body);
+  const createIfMissing = toBoolean(body.createIfMissing, false);
+  const preserveFocus = toBoolean(body.preserveFocus, false);
+  const preview = toBoolean(body.preview, false);
+  let created = false;
+
+  try {
+    await vscode.workspace.fs.stat(uri);
+  } catch {
+    if (!createIfMissing) {
+      throw structuredError("NOTEBOOK_NOT_FOUND", `Notebook does not exist: ${uri.fsPath}`);
+    }
+    if (uri.scheme !== "file") {
+      throw structuredError("NOTEBOOK_CREATE_UNSUPPORTED", "createIfMissing is only supported for file notebook targets");
+    }
+    await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(uri.fsPath)));
+    await vscode.workspace.fs.writeFile(uri, emptyNotebookBytes());
+    created = true;
+  }
+
+  const document = await vscode.workspace.openNotebookDocument(uri);
+  const shown = await vscode.window.showNotebookDocument(document, {
+    preserveFocus,
+    preview
+  });
+  updateActiveNotebookIdentity(shown, created ? "notebook-open-created" : "notebook-open");
+  bridgeState.lastNotebookAction = {
+    command: "open",
+    at: new Date().toISOString(),
+    target: { uri: uri.toString() },
+    created
+  };
+  return okResponse("notebook.open", {
+    result: {
+      created,
+      uri: uri.toString(),
+      fsPath: uri.scheme === "file" ? uri.fsPath : null
+    },
+    notebook: activeNotebookInfo(shown),
+    summary: created ? `Created and opened notebook: ${uri.toString()}` : `Opened notebook: ${uri.toString()}`
+  }, { includeState: false });
+}
+
 async function kernelShutdown() {
   throw structuredError("KERNEL_SHUTDOWN_UNSUPPORTED", "VS Code does not expose a supported public command for shutting down the current notebook kernel");
 }
@@ -3694,6 +3780,8 @@ async function httpPost(url, body) {
     case "/kernel/select":
       await executeCommand("notebook.selectKernel", [], { kind: "kernel" });
       return okResponse("kernel.select", { summary: "Kernel picker opened" }, { includeState: false });
+    case "/notebook/open":
+      return openNotebook(body);
     case "/notebook/save":
       return notebookCommand("notebook.save", "save");
     case "/notebook/revert":

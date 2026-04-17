@@ -37,6 +37,15 @@ If the user changed windows, reloaded VS Code, or closed an editor:
 - if there is no active notebook, do not attempt cell actions
 - recover focus or ask the user to restore the notebook when identity cannot be re-established
 
+## New Notebook Requests
+
+If the user asks for a new `.ipynb`:
+
+- distinguish between a static file request and an interactive notebook request
+- if the user wants execution, outputs, charts, or live notebook behavior, the new notebook must be the active editor before interactive bridge work starts
+- if there is no active notebook matching the intended new file and no notebook-open tool is available, say so plainly and ask the user to open the notebook once in the same VS Code window
+- do not silently create an offline file and present it as if interactive notebook execution had already happened
+
 ## Cell Targeting Guidance
 
 Use these locators in descending order of confidence:

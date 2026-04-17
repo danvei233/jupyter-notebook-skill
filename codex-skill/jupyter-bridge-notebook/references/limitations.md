@@ -13,3 +13,5 @@
 - Prefer targeted execution over `run all` when state is uncertain.
 - Re-read `/status`, `/context`, or `/output` after important operations.
 - Do not assume old cell selections remain valid across reloads or focus changes.
+- A newly created notebook file that is not open as the active editor is not yet a usable interactive bridge target.
+- Without a notebook-open capability, a user may need to open the intended new notebook once before shared interactive mutation and execution can begin.

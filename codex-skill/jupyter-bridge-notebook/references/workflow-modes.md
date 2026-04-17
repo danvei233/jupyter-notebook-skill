@@ -71,5 +71,7 @@ Prefer `blank` mode or file-only notebook generation when:
 
 - the user only wants a static notebook template
 - the task is mostly markdown editing or title cleanup
-- the target is not the active notebook
+- the target is not the active notebook and the user explicitly does not need live execution
 - live kernel state and live outputs are irrelevant
+
+Do not treat "create a new ipynb" as enough reason by itself to leave bridge-first mode. If the user also wants the notebook to run, show outputs, render figures, or behave interactively, keep it in the notebook workflow and require that the intended notebook becomes the active editor first.
