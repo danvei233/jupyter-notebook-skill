@@ -33,11 +33,13 @@ This is smart streaming, not mechanical over-checking.
 6. Escalate to full `/status` + `/compliance` + `/context` only for high-risk steps.
 7. Add or revise conclusions after outputs exist.
 8. Skip README, skill reference, extension source, command catalog, and capability reads unless bridge behavior is unclear.
-9. Do not pre-run the same notebook analysis in shell-side `python` / `py` if the notebook kernel is already available.
+9. Do not pre-run the same notebook analysis in shell-side `python` / `py` if the notebook kernel is already available; reserve shell-side experiments for explicit diagnostics.
+10. Use `cell.batch` only for a stage-sized block, not for a full notebook dump.
 
 ### Avoid
 
 - dumping title, markdown narrative, all code, and final conclusions in one pass
+- batch-appending or batch-updating an entire teaching notebook in one shot
 - using `/run/all` as the first meaningful validation step
 - pre-writing conclusions that depend on metrics, plots, or model results not yet observed
 - rereading full context before every low-risk mutation

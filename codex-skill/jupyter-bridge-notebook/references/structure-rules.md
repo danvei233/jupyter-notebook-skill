@@ -58,6 +58,7 @@ Prefer placing explicit validation boundaries between stages:
 - final reporting
 
 Each major stage should be runnable and checkable before the notebook grows further.
+When creating new structure through bridge batch operations, keep one batch to one stage, usually 2-4 related cells.
 
 ### Split markdown intentionally
 

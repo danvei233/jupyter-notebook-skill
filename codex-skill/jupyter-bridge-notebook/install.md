@@ -7,7 +7,7 @@ This skill depends on the VS Code extension `local.vscode-data-bridge`.
 Read this file when:
 
 - bridge calls fail
-- `GET /status/brief` is unavailable
+- `bridge_get_status_brief` is unavailable
 - notebook bridge commands are missing
 - the skill is being migrated to another machine
 
@@ -23,8 +23,8 @@ Read this file when:
    - run `scripts/bridgectl.exe -install-extension ..\\assets\\vscode-data-bridge\\vscode-data-bridge-0.0.1.vsix`
 5. After install:
    - ask the user to run `Developer: Reload Window`
-   - then verify with `GET /status/brief`
-   - then verify with `GET /compliance`
+   - then verify with `bridge_get_status_brief`
+   - then verify with `bridge_get_compliance`
 
 ## MCP-First Verification
 

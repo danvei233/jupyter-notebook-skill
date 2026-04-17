@@ -100,6 +100,9 @@ const bridgeState = {
   lastNotebookAction: null,
   lastMutation: null,
   lastError: null,
+  lastOperationId: null,
+  operationCounter: 0,
+  operations: {},
   server: {
     host: null,
     port: null,
@@ -219,6 +222,122 @@ function log(message) {
 
 function nonce() {
   return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function trimOperationHistory(limit = 80) {
+  const entries = Object.entries(bridgeState.operations);
+  if (entries.length <= limit) {
+    return;
+  }
+  entries
+    .sort((left, right) => {
+      const leftAt = left[1] && left[1].requestedAt ? Date.parse(left[1].requestedAt) : 0;
+      const rightAt = right[1] && right[1].requestedAt ? Date.parse(right[1].requestedAt) : 0;
+      return rightAt - leftAt;
+    })
+    .slice(limit)
+    .forEach(([operationId]) => {
+      delete bridgeState.operations[operationId];
+    });
+}
+
+function getOperationRecord(operationId) {
+  if (!operationId) {
+    return null;
+  }
+  return bridgeState.operations[operationId] || null;
+}
+
+function latestOperationRecord() {
+  const lastExecution = bridgeState.lastExecution;
+  const lastKernel = bridgeState.lastKernelAction;
+  if (!lastExecution && !lastKernel) {
+    return null;
+  }
+  if (!lastExecution) {
+    return lastKernel;
+  }
+  if (!lastKernel) {
+    return lastExecution;
+  }
+  return Date.parse(lastKernel.requestedAt || 0) > Date.parse(lastExecution.requestedAt || 0) ? lastKernel : lastExecution;
+}
+
+function syncRuntimeBusy(notebookUri) {
+  const runtime = notebookRuntimeRecord(notebookUri);
+  if (!runtime) {
+    return;
+  }
+  const pendingExecutionTargets = Object.values(bridgeState.operations)
+    .filter((operation) => operation && operation.kind === "execution" && operation.notebookUri === notebookUri && operation.pendingObservation)
+    .map((operation) => operation.target)
+    .filter(Boolean);
+  runtime.statusKnown = true;
+  runtime.pendingTargets = pendingExecutionTargets;
+  runtime.busy = pendingExecutionTargets.length > 0;
+  if (!runtime.busy) {
+    runtime.idleObservedAt = new Date().toISOString();
+  }
+}
+
+function createOperationRecord(kind, commandId, target, notebookUri, extras = {}) {
+  const operationId = `op_${Date.now()}_${++bridgeState.operationCounter}`;
+  const operation = {
+    operationId,
+    kind,
+    command: commandId,
+    target: target || null,
+    notebookUri,
+    notebookVersionToken: extras.notebookVersionToken || null,
+    requestedAt: new Date().toISOString(),
+    submitted: false,
+    submittedAt: null,
+    acknowledged: false,
+    acknowledgedAt: null,
+    completedAt: null,
+    pendingObservation: kind === "execution",
+    completionObserved: false,
+    outputObserved: false,
+    outputObservedAt: null,
+    identityStable: true,
+    identityDrifted: false,
+    identityDriftedAt: null,
+    status: kind === "execution" ? "pending" : "created",
+    timeoutState: null,
+    error: null,
+    supersededBy: null,
+    staleCleared: false,
+    noop: false
+  };
+  bridgeState.operations[operationId] = operation;
+  bridgeState.lastOperationId = operationId;
+  trimOperationHistory();
+  return operation;
+}
+
+function supersedePendingExecution(notebookUri, replacementId) {
+  if (!notebookUri) {
+    return;
+  }
+  const completedAt = new Date().toISOString();
+  for (const operation of Object.values(bridgeState.operations)) {
+    if (!operation || operation.kind !== "execution" || operation.notebookUri !== notebookUri || !operation.pendingObservation) {
+      continue;
+    }
+    if (operation.operationId === replacementId) {
+      continue;
+    }
+    operation.pendingObservation = false;
+    operation.completionObserved = false;
+    operation.completedAt = completedAt;
+    operation.status = "superseded";
+    operation.supersededBy = replacementId;
+  }
+  syncRuntimeBusy(notebookUri);
 }
 
 function escapeHtml(value) {
@@ -1151,6 +1270,16 @@ function observeIdentityDrift(editor, reason) {
     lastExecution.identityStable = false;
     lastExecution.identityDrifted = true;
     lastExecution.identityDriftedAt = driftedAt;
+    if (uriDrifted) {
+      clearExecutionOperation(lastExecution, runtime, "stale-cleared", {
+        completionObserved: false,
+        outputObserved: false,
+        identityStable: false,
+        identityDrifted: true,
+        identityDriftedAt: driftedAt,
+        staleCleared: true
+      });
+    }
   }
 }
 
@@ -1175,6 +1304,9 @@ function updateNotebookRuntimeFromEvent(event) {
     if (bridgeState.lastExecution && bridgeState.lastExecution.notebookUri === uri) {
       bridgeState.lastExecution.outputObserved = true;
       bridgeState.lastExecution.outputObservedAt = changedAt;
+      if (bridgeState.lastExecution.status === "pending") {
+        bridgeState.lastExecution.status = "completed-with-output";
+      }
     }
   }
 
@@ -1190,6 +1322,9 @@ function updateNotebookRuntimeFromEvent(event) {
       bridgeState.lastExecution.completedAt = changedAt;
       bridgeState.lastExecution.completionObserved = true;
       bridgeState.lastExecution.identityStable = !runtime.identityDrifted;
+      if (!bridgeState.lastExecution.status || bridgeState.lastExecution.status === "pending") {
+        bridgeState.lastExecution.status = bridgeState.lastExecution.outputObserved ? "completed-with-output" : "completed-no-output";
+      }
     }
   } else if (outputChanged && runtime.pendingTargets.length > 0) {
     runtime.busy = true;
@@ -1215,6 +1350,7 @@ function updateNotebookRuntimeFromEvent(event) {
   if (typeof observedExecutionOrder === "number") {
     runtime.lastObservedExecutionOrder = observedExecutionOrder;
   }
+  syncRuntimeBusy(uri);
 }
 
 function serializeCell(cell, index, options = {}) {
@@ -1287,8 +1423,8 @@ function kernelState(editor = activeNotebookEditor()) {
     lastOutputChangeAt: runtime ? runtime.lastOutputChangeAt : null,
     idleObservedAt: runtime ? runtime.idleObservedAt : null,
     pendingTargets: runtime ? runtime.pendingTargets : [],
-    lastKernelAction: bridgeState.lastKernelAction,
-    lastExecution: bridgeState.lastExecution
+    lastKernelAction: operationSummary(bridgeState.lastKernelAction),
+    lastExecution: operationSummary(bridgeState.lastExecution)
   };
 }
 
@@ -1307,25 +1443,96 @@ function debugState(editor = activeNotebookEditor()) {
   };
 }
 
-function executionState(editor = activeNotebookEditor()) {
-  const runtime = activeRuntime(editor);
-  const inferred = inferredExecutionObservation(editor);
+function derivedOperationStatus(operation, inferred = null) {
+  if (!operation) {
+    return null;
+  }
+  if (["failed", "superseded", "stale-cleared", "noop"].includes(operation.status)) {
+    return operation.status;
+  }
+  const observed = inferred || {
+    pendingObservation: operation.pendingObservation === true,
+    completionObserved: operation.completionObserved === true,
+    outputObserved: operation.outputObserved === true
+  };
+  if (observed.pendingObservation) {
+    return "pending";
+  }
+  if (observed.outputObserved) {
+    return "completed-with-output";
+  }
+  if (observed.completionObserved) {
+    return "completed-no-output";
+  }
+  if (operation.acknowledged === true) {
+    return "acknowledged";
+  }
+  if (operation.submitted === true) {
+    return "submitted";
+  }
+  return operation.status || null;
+}
+
+function operationSummary(operation, inferred = null) {
+  if (!operation) {
+    return null;
+  }
   return {
-    notebook: activeNotebookInfo(editor),
-    kernel: kernelState(editor),
-    requestedAt: bridgeState.lastExecution ? bridgeState.lastExecution.at : null,
-    pending: Boolean(runtime && runtime.busy),
+    operationId: operation.operationId,
+    kind: operation.kind,
+    command: operation.command,
+    target: operation.target || null,
+    notebookUri: operation.notebookUri,
+    requestedAt: operation.requestedAt,
+    submitted: operation.submitted === true,
+    submittedAt: operation.submittedAt || null,
+    acknowledged: operation.acknowledged === true,
+    acknowledgedAt: operation.acknowledgedAt || null,
+    completedAt: operation.completedAt || null,
+    pendingObservation: operation.pendingObservation === true,
+    completionObserved: operation.completionObserved === true,
+    outputObserved: operation.outputObserved === true,
+    outputObservedAt: operation.outputObservedAt || null,
+    identityStable: operation.identityStable !== false,
+    identityDrifted: operation.identityDrifted === true,
+    identityDriftedAt: operation.identityDriftedAt || null,
+    timeoutState: operation.timeoutState || null,
+    status: derivedOperationStatus(operation, inferred),
+    supersededBy: operation.supersededBy || null,
+    staleCleared: operation.staleCleared === true,
+    noop: operation.noop === true,
+    error: operation.error || null
+  };
+}
+
+function executionState(editor = activeNotebookEditor(), requestedOperationId = null) {
+  const operation = getOperationRecord(requestedOperationId) || bridgeState.lastExecution;
+  const relevantEditor = operation ? editorForNotebookUri(operation.notebookUri) || editor : editor;
+  const runtime = operation ? notebookRuntimeRecord(operation.notebookUri) : activeRuntime(relevantEditor);
+  const inferred = inferredExecutionObservation(relevantEditor, operation);
+  const status = derivedOperationStatus(operation, inferred);
+  return {
+    notebook: activeNotebookInfo(relevantEditor),
+    kernel: kernelState(relevantEditor),
+    operationId: operation ? operation.operationId : null,
+    requestedAt: operation ? operation.requestedAt : null,
+    pending: Boolean(operation && operation.pendingObservation),
     pendingTargets: runtime ? runtime.pendingTargets : [],
-    completedAt: bridgeState.lastExecution ? bridgeState.lastExecution.completedAt || null : null,
+    completedAt: operation ? operation.completedAt || null : null,
     completionObserved: inferred.completionObserved,
     outputObserved: inferred.outputObserved,
     outputObservedAt: inferred.outputObservedAt,
-    busy: Boolean(runtime && runtime.busy),
+    busy: Boolean(operation && operation.pendingObservation),
     idleObservedAt: runtime ? runtime.idleObservedAt : null,
     identityStable: inferred.identityStable,
-    identityDrifted: Boolean(bridgeState.lastExecution && bridgeState.lastExecution.identityDrifted),
-    lastExecution: bridgeState.lastExecution,
-    pendingObservation: Boolean(bridgeState.lastExecution && bridgeState.lastExecution.pendingObservation),
+    identityDrifted: Boolean(operation && operation.identityDrifted),
+    status: status,
+    submitted: Boolean(operation && operation.submitted),
+    acknowledged: Boolean(operation && operation.acknowledged),
+    timeoutState: operation ? operation.timeoutState || null : null,
+    operation: operationSummary(operation, inferred),
+    lastExecution: operationSummary(bridgeState.lastExecution, operation === bridgeState.lastExecution ? inferred : null),
+    pendingObservation: inferred.pendingObservation,
     observed: runtime
       ? {
           executionChangeCount: runtime.executionChangeCount,
@@ -1346,7 +1553,7 @@ function executionState(editor = activeNotebookEditor()) {
 function complianceState(editor = activeNotebookEditor()) {
   const runtime = activeRuntime(editor);
   const execution = bridgeState.lastExecution;
-  const inferred = inferredExecutionObservation(editor);
+  const inferred = inferredExecutionObservation(editor, execution);
   return {
     bridgeAvailable: Boolean(bridgeServer),
     bridgeMutationRequired: true,
@@ -1428,6 +1635,10 @@ function responseError(error, operation) {
       details: error.details || null
     }
   };
+}
+
+function serializeError(error) {
+  return responseError(error, "internal");
 }
 
 function okResponse(operation, payload = {}, options = {}) {
@@ -1582,37 +1793,128 @@ function resolveCellFromTarget(editor, target) {
   return null;
 }
 
+function editorForNotebookUri(uri) {
+  if (!uri) {
+    return null;
+  }
+  const active = activeNotebookEditor();
+  if (active && notebookUri(active) === uri) {
+    return active;
+  }
+  return (vscode.window.visibleNotebookEditors || []).find((editor) => notebookUri(editor) === uri) || null;
+}
+
 function hasCellOutputs(cell) {
   return Boolean(cell && Array.isArray(cell.outputs) && cell.outputs.length > 0);
 }
 
-function inferredExecutionObservation(editor = activeNotebookEditor()) {
-  const execution = bridgeState.lastExecution;
-  if (!editor || !execution || execution.notebookUri !== notebookUri(editor)) {
+function hasExecutionSignal(cell) {
+  const summary = executionSummary(cell);
+  return Boolean(
+    summary.executionOrder !== null ||
+    summary.success !== null ||
+    (summary.timing && (summary.timing.startTime || summary.timing.endTime))
+  );
+}
+
+function clearExecutionOperation(operation, runtime, status, extras = {}) {
+  if (!operation) {
+    return;
+  }
+  const completedAt = extras.completedAt || new Date().toISOString();
+  operation.pendingObservation = false;
+  operation.completedAt = operation.completedAt || completedAt;
+  operation.completionObserved = extras.completionObserved !== undefined ? extras.completionObserved : operation.completionObserved;
+  operation.outputObserved = extras.outputObserved !== undefined ? extras.outputObserved : operation.outputObserved;
+  operation.outputObservedAt = extras.outputObservedAt !== undefined ? extras.outputObservedAt : operation.outputObservedAt;
+  operation.identityStable = extras.identityStable !== undefined ? extras.identityStable : operation.identityStable;
+  operation.identityDrifted = extras.identityDrifted !== undefined ? extras.identityDrifted : operation.identityDrifted;
+  operation.identityDriftedAt = extras.identityDriftedAt !== undefined ? extras.identityDriftedAt : operation.identityDriftedAt;
+  operation.status = status || operation.status;
+  operation.noop = extras.noop !== undefined ? extras.noop : operation.noop;
+  operation.staleCleared = extras.staleCleared !== undefined ? extras.staleCleared : operation.staleCleared;
+  if (runtime) {
+    syncRuntimeBusy(operation.notebookUri);
+  }
+}
+
+function normalizeOperationTimeoutState(operation) {
+  if (!operation) {
+    return null;
+  }
+  if (operation.submitted === false) {
+    return "before-submit";
+  }
+  if (operation.submitted === true && operation.acknowledged === false) {
+    return "submitted-pending";
+  }
+  return "acknowledged";
+}
+
+function inferredExecutionObservation(editor = activeNotebookEditor(), operation = bridgeState.lastExecution) {
+  if (!editor || !operation || operation.notebookUri !== notebookUri(editor)) {
     return {
-      completionObserved: Boolean(execution && execution.completionObserved),
-      outputObserved: Boolean(execution && execution.outputObserved),
-      outputObservedAt: execution ? execution.outputObservedAt || null : null,
-      identityStable: execution ? execution.identityStable !== false : true
+      completionObserved: Boolean(operation && operation.completionObserved),
+      outputObserved: Boolean(operation && operation.outputObserved),
+      outputObservedAt: operation ? operation.outputObservedAt || null : null,
+      identityStable: operation ? operation.identityStable !== false : true,
+      status: operation ? operation.status || null : null,
+      pendingObservation: Boolean(operation && operation.pendingObservation)
     };
   }
 
   const runtime = activeRuntime(editor);
-  const target = resolveCellFromTarget(editor, execution.target);
-  const completionObserved = Boolean(execution.completionObserved || (runtime && runtime.completionObservedAt));
-  const outputObserved = Boolean(execution.outputObserved || (target && hasCellOutputs(target.cell)));
-  const outputObservedAt = execution.outputObservedAt || (outputObserved && runtime ? runtime.outputObservedAt || runtime.lastDocumentChangeAt : null);
+  const target = resolveCellFromTarget(editor, operation.target);
+  const versionDrifted = Boolean(
+    operation.notebookVersionToken &&
+    notebookVersionToken(editor) &&
+    operation.notebookVersionToken !== notebookVersionToken(editor)
+  );
 
-  if (outputObserved && !execution.outputObserved) {
-    execution.outputObserved = true;
-    execution.outputObservedAt = outputObservedAt;
+  if (operation.pendingObservation && target && normalizeSource(target.cell.document.getText()).trim() === "" && !hasCellOutputs(target.cell) && !hasExecutionSignal(target.cell)) {
+    clearExecutionOperation(operation, runtime, "noop", {
+      noop: true,
+      completionObserved: true,
+      outputObserved: false,
+      identityStable: !versionDrifted
+    });
+  }
+
+  if (operation.pendingObservation && !target && versionDrifted) {
+    clearExecutionOperation(operation, runtime, "stale-cleared", {
+      staleCleared: true,
+      completionObserved: false,
+      outputObserved: false,
+      identityStable: false,
+      identityDrifted: true,
+      identityDriftedAt: new Date().toISOString()
+    });
+  }
+
+  const completionObserved = Boolean(operation.completionObserved || (runtime && runtime.completionObservedAt));
+  const outputObserved = Boolean(operation.outputObserved || (target && hasCellOutputs(target.cell)));
+  const outputObservedAt = operation.outputObservedAt || (outputObserved && runtime ? runtime.outputObservedAt || runtime.lastDocumentChangeAt : null);
+
+  if (completionObserved && !operation.completionObserved) {
+    operation.completionObserved = true;
+    operation.completedAt = operation.completedAt || (runtime ? runtime.completionObservedAt : new Date().toISOString());
+    operation.status = operation.status === "pending" ? "completed" : operation.status;
+  }
+  if (outputObserved && !operation.outputObserved) {
+    operation.outputObserved = true;
+    operation.outputObservedAt = outputObservedAt;
+  }
+  if (!operation.pendingObservation && completionObserved) {
+    operation.status = outputObserved ? "completed-with-output" : "completed-no-output";
   }
 
   return {
     completionObserved,
     outputObserved,
     outputObservedAt,
-    identityStable: execution.identityStable !== false
+    identityStable: operation.identityStable !== false,
+    status: operation.status || null,
+    pendingObservation: Boolean(operation.pendingObservation)
   };
 }
 
@@ -1717,25 +2019,17 @@ async function executeCommand(commandId, args = [], meta = {}) {
   const currentEditor = activeNotebookEditor();
   const currentUri = notebookUri(currentEditor);
   const runtime = notebookRuntimeRecord(currentUri);
-  const result = await vscode.commands.executeCommand(commandId, ...args);
+  const operation = createOperationRecord(meta.kind || "command", commandId, meta.target || null, currentUri, {
+    notebookVersionToken: notebookVersionToken(currentEditor)
+  });
+
   if (meta.kind === "execution") {
-    bridgeState.lastExecution = {
-      command: commandId,
-      at: new Date().toISOString(),
-      target: meta.target || null,
-      pendingObservation: true,
-      notebookUri: currentUri,
-      completionObserved: false,
-      outputObserved: false,
-      outputObservedAt: null,
-      completedAt: null,
-      identityStable: true,
-      identityDrifted: false
-    };
+    supersedePendingExecution(currentUri, operation.operationId);
+    bridgeState.lastExecution = operation;
     if (runtime) {
       runtime.statusKnown = true;
       runtime.busy = true;
-      runtime.executionRequestedAt = bridgeState.lastExecution.at;
+      runtime.executionRequestedAt = operation.requestedAt;
       runtime.pendingTargets = meta.target ? [meta.target] : [];
       runtime.identityDrifted = false;
       runtime.driftedAt = null;
@@ -1743,35 +2037,124 @@ async function executeCommand(commandId, args = [], meta = {}) {
     }
   }
   if (meta.kind === "debug") {
-    bridgeState.lastDebug = {
-      command: commandId,
-      at: new Date().toISOString(),
-      target: meta.target || null,
-      notebookUri: currentUri
-    };
+    bridgeState.lastDebug = operation;
   }
   if (meta.kind === "kernel") {
-    bridgeState.lastKernelAction = {
-      command: commandId,
-      at: new Date().toISOString(),
-      target: meta.target || null,
-      notebookUri: currentUri
-    };
+    bridgeState.lastKernelAction = operation;
     if (runtime) {
       runtime.statusKnown = true;
-      if (commandId === "jupyter.interruptkernel" || commandId === "jupyter.restartkernel") {
-        runtime.busy = false;
-        runtime.pendingTargets = [];
-      }
     }
   }
   if (meta.kind === "notebook") {
-    bridgeState.lastNotebookAction = {
-      command: commandId,
-      at: new Date().toISOString()
-    };
+    bridgeState.lastNotebookAction = operation;
   }
-  return result;
+
+  let promise;
+  try {
+    promise = vscode.commands.executeCommand(commandId, ...args);
+  } catch (error) {
+    operation.status = "failed";
+    operation.error = responseError(error, commandId).error;
+    operation.completedAt = new Date().toISOString();
+    if (meta.kind === "execution" && runtime) {
+      runtime.busy = false;
+      runtime.pendingTargets = [];
+    }
+    throw error;
+  }
+
+  operation.submitted = true;
+  operation.submittedAt = new Date().toISOString();
+  operation.timeoutState = normalizeOperationTimeoutState(operation);
+
+  try {
+    const result = await promise;
+    operation.acknowledged = true;
+    operation.acknowledgedAt = new Date().toISOString();
+    operation.timeoutState = normalizeOperationTimeoutState(operation);
+    if (meta.kind !== "execution") {
+      operation.completedAt = operation.acknowledgedAt;
+      operation.pendingObservation = false;
+      operation.completionObserved = true;
+      operation.status = "acknowledged";
+    }
+    if (meta.kind === "kernel" && runtime && commandId === "jupyter.interruptkernel") {
+      runtime.busy = false;
+      runtime.pendingTargets = [];
+      runtime.idleObservedAt = operation.acknowledgedAt;
+    }
+    return result;
+  } catch (error) {
+    operation.acknowledged = operation.submitted;
+    operation.acknowledgedAt = new Date().toISOString();
+    operation.completedAt = operation.acknowledgedAt;
+    operation.timeoutState = normalizeOperationTimeoutState(operation);
+    operation.status = "failed";
+    operation.error = responseError(error, commandId).error;
+    if (meta.kind === "execution") {
+      operation.pendingObservation = false;
+      if (runtime) {
+        runtime.busy = false;
+        runtime.pendingTargets = [];
+        runtime.idleObservedAt = operation.completedAt;
+      }
+    }
+    throw error;
+  }
+}
+
+function dispatchCommand(commandId, args = [], meta = {}) {
+  log(`Dispatching command: ${commandId}`);
+  const currentEditor = activeNotebookEditor();
+  const currentUri = notebookUri(currentEditor);
+  const runtime = notebookRuntimeRecord(currentUri);
+  const operation = createOperationRecord(meta.kind || "command", commandId, meta.target || null, currentUri, {
+    notebookVersionToken: notebookVersionToken(currentEditor)
+  });
+
+  if (meta.kind === "kernel") {
+    bridgeState.lastKernelAction = operation;
+    if (runtime) {
+      runtime.statusKnown = true;
+    }
+  }
+
+  let promise;
+  try {
+    promise = vscode.commands.executeCommand(commandId, ...args);
+  } catch (error) {
+    operation.status = "failed";
+    operation.error = responseError(error, commandId).error;
+    operation.completedAt = new Date().toISOString();
+    throw error;
+  }
+
+  operation.submitted = true;
+  operation.submittedAt = new Date().toISOString();
+  operation.status = "submitted";
+  operation.timeoutState = normalizeOperationTimeoutState(operation);
+
+  promise
+    .then(() => {
+      operation.acknowledged = true;
+      operation.acknowledgedAt = new Date().toISOString();
+      operation.completedAt = operation.acknowledgedAt;
+      operation.pendingObservation = false;
+      operation.completionObserved = true;
+      operation.status = "acknowledged";
+      operation.timeoutState = normalizeOperationTimeoutState(operation);
+    })
+    .catch((error) => {
+      operation.acknowledged = operation.submitted;
+      operation.acknowledgedAt = new Date().toISOString();
+      operation.completedAt = operation.acknowledgedAt;
+      operation.pendingObservation = false;
+      operation.status = "failed";
+      operation.error = responseError(error, commandId).error;
+      operation.timeoutState = normalizeOperationTimeoutState(operation);
+    });
+
+  return operation;
 }
 
 async function executeBridgeCommand(commandId, args) {
@@ -1798,9 +2181,11 @@ async function executeCellByIndex(index, options = {}) {
         target: { index: target.index, id: cellId(target.cell) }
       });
       const targetId = cellId(target.cell);
+      const execution = bridgeState.lastExecution;
       return okResponse("executeCellByIndex", {
         index: target.index,
         cellId: targetId,
+        operationId: execution ? execution.operationId : null,
         accepted: true,
         pendingObservation: true,
         summary: `Execution requested for cell ${target.index}`
@@ -2118,6 +2503,44 @@ function notebookCellStateFromCell(cell) {
   };
 }
 
+function stateReadToken(state, index) {
+  return [
+    state.id || state.metadata?.id || null,
+    index,
+    stableHash(normalizeSource(state.source)),
+    stableHash(state.metadata || {}),
+    (state.outputs || []).length
+  ].join(":");
+}
+
+function expectedReadToken(payload = {}) {
+  return textValue(payload.readToken || payload.expectedReadToken || payload.ifMatchReadToken);
+}
+
+function assertStateReadTokenMatches(state, index, payload = {}) {
+  const expected = expectedReadToken(payload);
+  if (!expected) {
+    return;
+  }
+  const actual = stateReadToken(state, index);
+  if (expected !== actual) {
+    throw structuredError("CELL_STALE_READ", `Cell ${index} changed since it was last read`, {
+      index,
+      cellId: state.id || state.metadata?.id || null,
+      expectedReadToken: expected,
+      actualReadToken: actual
+    });
+  }
+}
+
+function markStateForSourceVerification(state, source, operationIndex = null) {
+  if (!state) {
+    return;
+  }
+  state.__verifySource = normalizeSource(source);
+  state.__verifyOperationIndex = operationIndex;
+}
+
 function cloneNotebookCellState(state) {
   return {
     id: state.id || state.metadata?.id || null,
@@ -2280,6 +2703,36 @@ function normalizeBatchMode(value) {
   return ["transactional", "bestEffort"].includes(mode) ? mode : "transactional";
 }
 
+function verifyBatchAppliedSources(editor, states) {
+  let verifiedCount = 0;
+  for (let index = 0; index < states.length; index += 1) {
+    const state = states[index];
+    if (!Object.prototype.hasOwnProperty.call(state, "__verifySource")) {
+      continue;
+    }
+    verifiedCount += 1;
+    const actualCell = editor.notebook.cellAt(index);
+    const actualSource = normalizeSource(actualCell.document.getText());
+    const expectedSource = normalizeSource(state.__verifySource);
+    if (actualSource !== expectedSource) {
+      return {
+        verified: false,
+        verifiedCount,
+        failedVerificationAt: state.__verifyOperationIndex ?? index,
+        failedVerificationCellIndex: index,
+        sourcePresent: actualSource.length > 0,
+        expectedSourceBytes: Buffer.byteLength(expectedSource, "utf8"),
+        actualSourceBytes: Buffer.byteLength(actualSource, "utf8")
+      };
+    }
+  }
+  return {
+    verified: true,
+    verifiedCount,
+    failedVerificationAt: null
+  };
+}
+
 function createBatchInsertState(request, append, states) {
   const index = append ? states.length : toInteger(request.index, states.length);
   if (index < 0 || index > states.length) {
@@ -2299,13 +2752,43 @@ function createBatchInsertState(request, append, states) {
   return { state, index };
 }
 
+function batchOperationKind(operation) {
+  const explicit = textValue(operation.op || operation.action);
+  if (explicit) {
+    return explicit;
+  }
+  const hasLocator =
+    operation.index !== undefined ||
+    operation.indexes !== undefined ||
+    operation.indices !== undefined ||
+    operation.marker !== undefined ||
+    operation.cellId !== undefined ||
+    operation.id !== undefined ||
+    operation.selection !== undefined ||
+    operation.readToken !== undefined ||
+    operation.toIndex !== undefined ||
+    operation.direction !== undefined ||
+    operation.outputs !== undefined ||
+    operation.all !== undefined;
+  const looksLikeNewCell =
+    operation.source !== undefined ||
+    operation.kind !== undefined ||
+    operation.languageId !== undefined ||
+    operation.metadata !== undefined;
+  if (!hasLocator && looksLikeNewCell) {
+    return "append";
+  }
+  return "";
+}
+
 function applyBatchOperationToState(states, operation, batchState) {
-  const kind = textValue(operation.op || operation.action);
+  const kind = batchOperationKind(operation);
   const request = { ...operation, noFollow: true };
   switch (kind) {
     case "insert":
     case "append": {
       const { state, index } = createBatchInsertState(request, kind === "append", states);
+        markStateForSourceVerification(state, request.source, request.__batchOperationIndex);
       batchState.mutated = true;
       return {
         operation: kind === "append" ? "cell.append" : "cell.insert",
@@ -2317,30 +2800,14 @@ function applyBatchOperationToState(states, operation, batchState) {
     }
     case "update": {
       const target = findStateCell(states, request, { selectionIndex: batchState.selectionIndex });
-      if (request.readToken || request.expectedReadToken || request.ifMatchReadToken) {
-        const actualToken = [
-          target.cell.id || target.cell.metadata?.id || null,
-          target.index,
-          stableHash(normalizeSource(target.cell.source)),
-          stableHash(target.cell.metadata || {}),
-          (target.cell.outputs || []).length
-        ].join(":");
-        const expectedToken = textValue(request.readToken || request.expectedReadToken || request.ifMatchReadToken);
-        if (expectedToken && expectedToken !== actualToken) {
-          throw structuredError("CELL_STALE_READ", `Cell ${target.index} changed since it was last read`, {
-            index: target.index,
-            cellId: target.cell.id || target.cell.metadata?.id || null,
-            expectedReadToken: expectedToken,
-            actualReadToken: actualToken
-          });
-        }
-      }
+      assertStateReadTokenMatches(target.cell, target.index, request);
       const nextState = cloneNotebookCellState(target.cell);
       if (request.kind !== undefined) {
         nextState.kind = notebookKind(request.kind) === vscode.NotebookCellKind.Markup ? "markdown" : "code";
       }
       if (request.source !== undefined) {
         nextState.source = normalizeSource(request.source);
+        markStateForSourceVerification(nextState, request.source, request.__batchOperationIndex);
       }
       if (request.metadata !== undefined) {
         nextState.metadata = cloneNotebookValue(request.metadata || {});
@@ -2362,6 +2829,10 @@ function applyBatchOperationToState(states, operation, batchState) {
       };
     }
     case "delete": {
+      if (!arrayValue(request.indexes || request.indices || request.index).length) {
+        const target = findStateCell(states, request, { selectionIndex: batchState.selectionIndex });
+        assertStateReadTokenMatches(target.cell, target.index, request);
+      }
       const indexes = resolveDeleteIndexesFromState(states, request, batchState.selectionIndex);
       for (let i = indexes.length - 1; i >= 0; i -= 1) {
         states.splice(indexes[i], 1);
@@ -2378,6 +2849,7 @@ function applyBatchOperationToState(states, operation, batchState) {
     }
     case "move": {
       const target = findStateCell(states, request, { selectionIndex: batchState.selectionIndex });
+      assertStateReadTokenMatches(target.cell, target.index, request);
       const destinationIndex =
         request.toIndex !== undefined
           ? toInteger(request.toIndex)
@@ -2405,6 +2877,7 @@ function applyBatchOperationToState(states, operation, batchState) {
     }
     case "duplicate": {
       const target = findStateCell(states, request, { selectionIndex: batchState.selectionIndex });
+      assertStateReadTokenMatches(target.cell, target.index, request);
       const insertIndex = toInteger(request.toIndex, target.index + 1);
       if (insertIndex < 0 || insertIndex > states.length) {
         throw structuredError("CELL_INDEX_OUT_OF_RANGE", `Cell index out of range: ${insertIndex}`);
@@ -2446,6 +2919,7 @@ function applyBatchOperationToState(states, operation, batchState) {
     }
     case "replaceOutputs": {
       const target = findStateCell(states, request, { selectionIndex: batchState.selectionIndex });
+      assertStateReadTokenMatches(target.cell, target.index, request);
       target.cell.outputs = buildOutputs(request.outputs || []);
       batchState.mutated = true;
       return {
@@ -2471,6 +2945,7 @@ function applyBatchOperationToState(states, operation, batchState) {
         };
       }
       const target = findStateCell(states, request, { selectionIndex: batchState.selectionIndex });
+      assertStateReadTokenMatches(target.cell, target.index, request);
       target.cell.outputs = [];
       batchState.mutated = true;
       return {
@@ -2482,7 +2957,10 @@ function applyBatchOperationToState(states, operation, batchState) {
       };
     }
     default:
-      throw structuredError("BATCH_OPERATION_NOT_SUPPORTED", `Unsupported batch operation: ${kind}`);
+      throw structuredError("BATCH_OPERATION_NOT_SUPPORTED", `Unsupported batch operation: ${kind || "(missing op)"}`, {
+        supportedOps: ["append", "insert", "update", "delete", "move", "duplicate", "select", "reveal", "replaceOutputs", "clearOutputs"],
+        hint: "Each batch operation should include op. For pure new-cell payloads without a locator, append is inferred automatically."
+      });
   }
 }
 
@@ -2495,6 +2973,7 @@ async function batchCells(payload) {
   const editor = getEditorOrThrow();
   const mode = normalizeBatchMode(payload.mode);
   const verboseResults = toBoolean(payload.verboseResults, false);
+  const originalStates = getNotebookCells(editor).map((cell) => notebookCellStateFromCell(cell));
   const states = getNotebookCells(editor).map((cell) => notebookCellStateFromCell(cell));
   const batchState = {
     selectionIndex: batchSelectionIndex(editor),
@@ -2505,7 +2984,7 @@ async function batchCells(payload) {
   const errors = [];
 
   for (let i = 0; i < operations.length; i += 1) {
-    const operation = operations[i];
+    const operation = { ...operations[i], __batchOperationIndex: i };
     try {
       const result = applyBatchOperationToState(states, operation, batchState);
       results.push(verboseResults ? result : compactBatchResult(result));
@@ -2528,6 +3007,31 @@ async function batchCells(payload) {
 
   if (batchState.mutated) {
     await applyNotebookCellReplacement(editor, 0, editor.notebook.cellCount, states.map((state) => notebookCellDataFromState(state)));
+  }
+  let verification = { verified: true, verifiedCount: 0, failedVerificationAt: null };
+  if (batchState.mutated) {
+    verification = verifyBatchAppliedSources(getEditorOrThrow(), states);
+    if (!verification.verified) {
+      errors.push({
+        at: verification.failedVerificationAt,
+        op: "verification",
+        error: {
+          code: "BATCH_VERIFICATION_FAILED",
+          message: `Source verification failed at cell ${verification.failedVerificationAt}`,
+          details: verification
+        }
+      });
+      if (mode === "transactional") {
+        const currentEditor = getEditorOrThrow();
+        await applyNotebookCellReplacement(
+          currentEditor,
+          0,
+          currentEditor.notebook.cellCount,
+          originalStates.map((state) => notebookCellDataFromState(state))
+        );
+        throw structuredError("BATCH_VERIFICATION_FAILED", `Batch verification failed at cell ${verification.failedVerificationAt}`, verification);
+      }
+    }
   }
   if (batchState.uiAction && states.length > 0) {
     const updatedEditor = getEditorOrThrow();
@@ -2559,7 +3063,11 @@ async function batchCells(payload) {
       completedCount: results.length,
       failedAt: errors.length > 0 ? errors[0].at : null,
       mode,
-      partial: mode === "bestEffort" && errors.length > 0
+      partial: mode === "bestEffort" && errors.length > 0,
+      verified: verification.verified,
+      verifiedCount: verification.verifiedCount,
+      failedVerificationAt: verification.failedVerificationAt,
+      sourcePresent: verification.verified ? null : verification.sourcePresent
     },
     errors,
     results,
@@ -2571,7 +3079,9 @@ async function runNotebookCommandWithLocator(operation, commandId, payload, opti
   const editor = getEditorOrThrow();
   if (options.useCurrentSelection) {
     await executeCommand(commandId, [], { kind: "execution", target: { selection: "current" } });
+    const execution = bridgeState.lastExecution;
     return okResponse(operation, {
+      operationId: execution ? execution.operationId : null,
       accepted: true,
       pendingObservation: true,
       completionObserved: false,
@@ -2589,8 +3099,14 @@ async function runNotebookCommandWithLocator(operation, commandId, payload, opti
         kind: "execution",
         target: { index: target.index, id: cellId(target.cell) }
       });
+      const execution = bridgeState.lastExecution;
       return okResponse(operation, {
-        cell: serializeCell(target.cell, target.index),
+        operationId: execution ? execution.operationId : null,
+        cell: compactCellSummary(serializeCell(target.cell, target.index, {
+          includeSource: false,
+          includeMetadata: false,
+          includeOutputs: false
+        })),
         accepted: true,
         pendingObservation: true,
         completionObserved: false,
@@ -2622,7 +3138,11 @@ async function debugNotebookCommand(operation, commandId, payload = {}, options 
         target: { index: target.index, id: cellId(target.cell) }
       });
       return okResponse(operation, {
-        cell: serializeCell(target.cell, target.index),
+        cell: compactCellSummary(serializeCell(target.cell, target.index, {
+          includeSource: false,
+          includeMetadata: false,
+          includeOutputs: false
+        })),
         debug: debugState(editor),
         summary: `Debug command executed for cell ${target.index}`
       }, { includeState: false });
@@ -2633,12 +3153,38 @@ async function debugNotebookCommand(operation, commandId, payload = {}, options 
 
 async function kernelCommand(operation, commandId, payload = {}, options = {}) {
   if (options.useLocator) {
-    return runNotebookCommandWithLocator(operation, commandId, payload, {});
+    return withCellSelection(
+      getEditorOrThrow(),
+      payload,
+      async (target) => {
+        const kernelOperation = dispatchCommand(commandId, [], {
+          kind: "kernel",
+          target: { index: target.index, id: cellId(target.cell) }
+        });
+        return okResponse(operation, {
+          operationId: kernelOperation.operationId,
+          submitted: kernelOperation.submitted,
+          acknowledged: kernelOperation.acknowledged,
+          timeoutState: kernelOperation.timeoutState,
+          cell: compactCellSummary(serializeCell(target.cell, target.index, {
+            includeSource: false,
+            includeMetadata: false,
+            includeOutputs: false
+          })),
+          summary: `Kernel command submitted: ${commandId}`
+        }, { includeState: false });
+      },
+      { restoreSelection: toBoolean(payload.restoreSelection, false) }
+    );
   }
-  await executeCommand(commandId, [], { kind: "kernel", target: payload || null });
+  const kernelOperation = dispatchCommand(commandId, [], { kind: "kernel", target: payload || null });
   return okResponse(operation, {
-    result: { command: commandId },
-    summary: `Kernel command executed: ${commandId}`
+    operationId: kernelOperation.operationId,
+    submitted: kernelOperation.submitted,
+    acknowledged: kernelOperation.acknowledged,
+    timeoutState: kernelOperation.timeoutState,
+    result: { command: commandId, submitted: kernelOperation.submitted, acknowledged: kernelOperation.acknowledged },
+    summary: `Kernel command submitted: ${commandId}`
   }, { includeState: false });
 }
 
@@ -2671,11 +3217,15 @@ async function workflowUpdateAndRun(body) {
     : await runNotebookCommandWithLocator("workflow.updateAndRun", "notebook.cell.execute", body);
   const observe = normalizeObserveMode(body.observe);
   const includeOutput = toBoolean(body.includeOutput, false);
+  const operationId = execution.operationId || null;
   let output = null;
+  if (observe !== "none") {
+    await awaitExecutionState(operationId, observe === "outputSummary" || includeOutput ? "output" : "completion", toInteger(body.timeoutMs, 3000));
+  }
   if (includeOutput) {
-    output = await readOutput(body, { includeState: false });
+    output = await readOutput({ ...body, operationId }, { includeState: false, operationId });
   } else if (observe === "outputSummary") {
-    output = await readOutput(body, { summaryOnly: true, includeState: false });
+    output = await readOutput({ ...body, operationId }, { summaryOnly: true, includeState: false, operationId });
   }
   return okResponse("workflow.updateAndRun", {
     mutation: compactMutationResult(update),
@@ -2694,18 +3244,22 @@ async function workflowUpdateAndRun(body) {
 
 async function workflowInsertAndRun(body) {
   const insert = body.append ? await insertCell(body, true) : await insertCell(body, false);
-  const targetIndex = insert.cell.index;
+  const targetIndex = insert.index;
   if (toBoolean(body.clearOutputs, false)) {
     await clearOutputs({ index: targetIndex });
   }
   const execution = await runNotebookCommandWithLocator("workflow.insertAndRun", "notebook.cell.execute", { index: targetIndex });
   const observe = normalizeObserveMode(body.observe);
   const includeOutput = toBoolean(body.includeOutput, false);
+  const operationId = execution.operationId || null;
   let output = null;
+  if (observe !== "none") {
+    await awaitExecutionState(operationId, observe === "outputSummary" || includeOutput ? "output" : "completion", toInteger(body.timeoutMs, 3000));
+  }
   if (includeOutput) {
-    output = await readOutput({ index: targetIndex }, { includeState: false });
+    output = await readOutput({ index: targetIndex, operationId }, { includeState: false, operationId });
   } else if (observe === "outputSummary") {
-    output = await readOutput({ index: targetIndex }, { summaryOnly: true, includeState: false });
+    output = await readOutput({ index: targetIndex, operationId }, { summaryOnly: true, includeState: false, operationId });
   }
   return okResponse("workflow.insertAndRun", {
     mutation: compactMutationResult(insert),
@@ -2724,8 +3278,64 @@ async function workflowInsertAndRun(body) {
 }
 
 function normalizeObserveMode(value) {
-  const mode = textValue(value, "completion");
+  const mode = textValue(value, "none");
   return ["none", "completion", "outputSummary"].includes(mode) ? mode : "completion";
+}
+
+function normalizeWaitFor(value) {
+  const mode = textValue(value, "");
+  if (mode === "idle") {
+    return "stable";
+  }
+  return ["", "completion", "output", "stable"].includes(mode) ? mode : "completion";
+}
+
+function waitConditionSatisfied(state, waitFor) {
+  if (!waitFor) {
+    return true;
+  }
+  if (!state || !state.operation) {
+    return true;
+  }
+  if (state.operation.status === "failed" || state.operation.status === "superseded" || state.operation.status === "stale-cleared" || state.operation.status === "noop") {
+    return true;
+  }
+  if (waitFor === "completion") {
+    return state.completionObserved === true || state.pendingObservation === false;
+  }
+  if (waitFor === "output") {
+    return state.outputObserved === true || (state.completionObserved === true && state.pendingObservation === false);
+  }
+  if (waitFor === "stable") {
+    return state.pendingObservation === false;
+  }
+  return true;
+}
+
+async function awaitExecutionState(operationId, waitFor, timeoutMs = 3000) {
+  const desired = normalizeWaitFor(waitFor);
+  let delayMs = 60;
+  const startedAt = Date.now();
+  let state = executionState(activeNotebookEditor(), operationId);
+  while (!waitConditionSatisfied(state, desired)) {
+    if (Date.now() - startedAt >= Math.max(timeoutMs, 0)) {
+      return {
+        ...state,
+        waitFor: desired,
+        waitTimedOut: true,
+        waitedMs: Date.now() - startedAt
+      };
+    }
+    await sleep(delayMs);
+    delayMs = Math.min(Math.round(delayMs * 1.6), 500);
+    state = executionState(activeNotebookEditor(), operationId);
+  }
+  return {
+    ...state,
+    waitFor: desired,
+    waitTimedOut: false,
+    waitedMs: Date.now() - startedAt
+  };
 }
 
 function compactMutationResult(response) {
@@ -2746,6 +3356,7 @@ function compactExecutionResult(response, observe = "completion") {
   const cell = compactCellSummary(response.cell);
   return {
     operation: response.operation || null,
+    operationId: response.operationId || null,
     accepted: response.accepted === true,
     pendingObservation: response.pendingObservation === true,
     completionObserved: observe === "none" ? null : response.completionObserved === true,
@@ -2772,18 +3383,30 @@ async function readOutput(locator, options = {}) {
   const hasOutputs = Array.isArray(target.cell.outputs) && target.cell.outputs.length > 0;
   const outputSummary = cellOutputSummary(target.cell);
   const hasError = cellHasErrorOutput(target.cell);
-  const inferred = inferredExecutionObservation(active);
+  const operation = getOperationRecord(textValue(options.operationId || locator.operationId)) || bridgeState.lastExecution;
+  const inferred = inferredExecutionObservation(active, operation);
   const observedFromBridgeExecution = Boolean(
-    bridgeState.lastExecution &&
-    bridgeState.lastExecution.notebookUri === notebookUri(active) &&
+    operation &&
+    operation.notebookUri === notebookUri(active) &&
     inferred.outputObserved &&
     (!runtime || runtime.lastObservedCellIds.length === 0 || runtime.lastObservedCellIds.includes(cell.id))
   );
+  const executionStateLabel = inferred.pendingObservation
+    ? "pending"
+    : hasOutputs
+      ? "completed-with-output"
+      : inferred.completionObserved
+        ? "completed-no-output"
+        : "not-executed";
   const payload = {
     cell,
     hasOutputs,
     hasError,
     outputSummary,
+    operationId: operation ? operation.operationId : null,
+    executionState: executionStateLabel,
+    completionObserved: inferred.completionObserved,
+    pendingObservation: inferred.pendingObservation,
     observedFromBridgeExecution,
     summary: `Collected outputs for cell ${target.index}`
   };
@@ -2902,19 +3525,26 @@ async function httpGet(url) {
         cellId: url.searchParams.get("cellId"),
         id: url.searchParams.get("id"),
         marker: url.searchParams.get("marker"),
-        selection: url.searchParams.get("selection")
-      }, { summaryOnly: true, includeState: false });
+        selection: url.searchParams.get("selection"),
+        operationId: url.searchParams.get("operationId")
+      }, { summaryOnly: true, includeState: false, operationId: url.searchParams.get("operationId") });
     case "/output": {
       return readOutput({
         index: url.searchParams.get("index"),
         cellId: url.searchParams.get("cellId"),
         id: url.searchParams.get("id"),
         marker: url.searchParams.get("marker"),
-        selection: url.searchParams.get("selection")
+        selection: url.searchParams.get("selection"),
+        operationId: url.searchParams.get("operationId")
       });
     }
-    case "/execution/state":
-      return okResponse("execution.state", executionState(editor));
+    case "/execution/state": {
+      const operationId = textValue(url.searchParams.get("operationId"));
+      const waitFor = normalizeWaitFor(url.searchParams.get("waitFor"));
+      const timeoutMs = toInteger(url.searchParams.get("timeoutMs"), 3000);
+      const state = waitFor ? await awaitExecutionState(operationId, waitFor, timeoutMs) : executionState(editor, operationId);
+      return okResponse("execution.state", state, { includeState: false });
+    }
     case "/debug/state":
       return okResponse("debug.state", { debug: debugState(editor) });
     default:
@@ -2976,7 +3606,9 @@ async function httpPost(url, body) {
       return runNotebookCommandWithLocator("run.below", "notebook.cell.executeCellAndBelow", body);
     case "/run/all":
       await executeCommand("notebook.execute", [], { kind: "execution", target: { scope: "all" } });
+      const execution = bridgeState.lastExecution;
       return okResponse("run.all", {
+        operationId: execution ? execution.operationId : null,
         accepted: true,
         pendingObservation: true,
         completionObserved: false,
@@ -3076,9 +3708,11 @@ async function startServer() {
             ? 401
             : error.code === "METHOD_NOT_ALLOWED"
               ? 405
+              : error.code === "CELL_STALE_READ"
+                ? 409
               : error.code && error.code.includes("NOT_ALLOWED")
                 ? 403
-                : error.code && (error.code.includes("NOT_FOUND") || error.code.includes("OUT_OF_RANGE") || error.code.includes("REQUIRED") || error.code.includes("AMBIGUOUS") || error.code.includes("UNSUPPORTED"))
+                : error.code && (error.code.includes("NOT_FOUND") || error.code.includes("OUT_OF_RANGE") || error.code.includes("REQUIRED") || error.code.includes("AMBIGUOUS") || error.code.includes("UNSUPPORTED") || error.code.includes("VERIFICATION") || error.code.includes("TRANSACTION") || error.code.includes("STALE"))
                   ? 400
                   : 500;
       jsonResponse(res, statusCode, payload);

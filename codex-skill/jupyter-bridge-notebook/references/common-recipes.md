@@ -16,7 +16,7 @@ Only do this for high-risk steps, not as the default notebook preflight.
 3. Call `bridge_get_context`
 4. Inspect notebook `uri`, `identity.versionToken`, selection, cells, execution state, and summaries
 5. Choose the next mutation or execution step
-6. If MCP is unavailable, fall back to `GET /status`, `GET /compliance`, and `GET /context`
+6. If MCP is unavailable, use the diagnostics appendix and the equivalent CLI fallback reads
 
 ## Diagnostics Only
 
@@ -34,7 +34,7 @@ Do not use them as notebook-task preflight.
 2. Confirm notebook `uri`, selection, `versionToken`, busy/idle, and server
 3. Continue with the smallest safe mutation or workflow call
 4. Escalate to full context only if identity, kernel, or locator risk is unclear
-5. If MCP is unavailable, fall back to `GET /status/brief`
+5. If MCP is unavailable, use the diagnostics appendix and the equivalent CLI fallback read
 6. Do not follow this with `bridge_get_compliance` or `bridge_get_context` unless something is actually ambiguous
 
 ## Select a Bridge Server
@@ -53,21 +53,7 @@ Do not use them as notebook-task preflight.
 4. Do not scatter `bridge_body_*.json` files in the workspace root.
 5. Reuse or clean temporary files when the step is complete.
 
-## Correct CLI Shape
-
-Only use this when MCP is unavailable or when you need low-level troubleshooting.
-
-1. `bridgectl.exe -method GET -path /status/brief`
-2. `bridgectl.exe -method POST -path /cell/update -body-file ./tmp/bridgebody/update.json`
-3. `bridgectl.exe -method POST -path /workflow/updateAndRun -body-file ./tmp/bridgebody/workflow.json`
-
-Rules:
-
-1. Always include `-method`
-2. Always include `-path`
-3. Use routes like `/status/brief`, `/cell/update`, `/workflow/updateAndRun`
-4. Do not invent positional command forms
-5. For multi-line JSON, prefer `-body-file`
+For raw CLI examples, use the diagnostics appendix instead of teaching them in the normal notebook path.
 
 ## Update a Specific Cell
 
@@ -87,6 +73,7 @@ Rules:
 4. Re-check order with `bridge_get_cells` only when ordering is ambiguous
 5. Keep long workflows split across multiple code cells; do not collapse the whole analysis into one generator script
 6. Let `cell.batch` stay transactional by default; only switch to `bestEffort` when partial success is intentionally acceptable
+7. Default batch size is one stage, usually 2-4 related cells; do not dump an entire teaching notebook in one batch
 
 ## Build A Notebook Incrementally
 
@@ -99,6 +86,7 @@ Rules:
 7. Add conclusions only after the supporting outputs already exist
 8. Do not default to `bridge_post_run_all` for a fresh notebook build
 9. Do not burn time reading README, extension source, or command catalogs during a normal build unless the bridge behaves unexpectedly
+10. If the notebook kernel is already available, do not pre-run the same analysis in shell-side `python` / `py`; keep shell experiments for explicit diagnostics only
 
 ## Prepare Plotting Style
 
@@ -119,6 +107,7 @@ Rules:
 4. Inspect `bridge_get_execution_state`
 5. Confirm outputs with `bridge_get_output_summary`
 6. If `completionObserved=false` or `outputObserved=false`, diagnose the bridge path first instead of switching to `nbclient` or a Python writeback flow
+7. Prefer `bridge_get_execution_state` with `waitFor` plus `timeoutMs` for long-running work; do not hand-roll fixed-interval sleep loops
 
 ## Final Full Pass
 
@@ -186,4 +175,5 @@ Then use:
 - Do not pre-run the same notebook analysis in shell-side `python` / `py` when the notebook kernel is available.
 - Do not poll the `.ipynb` file as proof of success if the requested behavior was interactive notebook execution.
 - Do not build an entire notebook in one shot and then rely on `bridge_post_run_all` as the first real validation step.
+- Do not use `bridge_post_cell_batch` to inject a full notebook worth of code and markdown in one pass when stage-by-stage batches would work.
 - If you must leave bridge mode, say so explicitly and get user approval first.

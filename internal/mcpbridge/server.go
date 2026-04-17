@@ -49,6 +49,47 @@ type serverOverrideInput struct {
 	ServerID string `json:"serverId,omitempty" jsonschema:"server identifier from bridge_list_servers; defaults to baseUrl"`
 }
 
+func boolPtr(v bool) *bool {
+	return &v
+}
+
+func routeAnnotations(method, path string) *mcp.ToolAnnotations {
+	annotations := &mcp.ToolAnnotations{
+		OpenWorldHint: boolPtr(false),
+	}
+
+	if strings.EqualFold(method, "GET") {
+		annotations.ReadOnlyHint = true
+		annotations.IdempotentHint = true
+		annotations.DestructiveHint = boolPtr(false)
+		return annotations
+	}
+
+	switch path {
+	case "/cell/select", "/cell/reveal", "/notebook/focus", "/viewer/variables/open", "/viewer/data/open", "/viewer/output/open", "/kernel/select", "/interpreter/select":
+		annotations.DestructiveHint = boolPtr(false)
+	case "/cell/clearOutputs", "/output/clear", "/cell/delete", "/notebook/revert", "/kernel/interrupt", "/kernel/restart", "/kernel/restartAndRunAll", "/kernel/restartAndRunToCell", "/kernel/shutdown":
+		annotations.DestructiveHint = boolPtr(true)
+	default:
+		annotations.DestructiveHint = boolPtr(false)
+	}
+
+	switch path {
+	case "/cell/select", "/cell/reveal", "/notebook/focus", "/notebook/save", "/viewer/variables/open", "/viewer/data/open", "/viewer/output/open", "/kernel/select", "/interpreter/select", "/cell/clearOutputs", "/output/clear":
+		annotations.IdempotentHint = true
+	}
+
+	return annotations
+}
+
+func routeTool(route bridgecatalog.RouteCapability) *mcp.Tool {
+	return &mcp.Tool{
+		Name:        route.Tool,
+		Description: route.Description,
+		Annotations: routeAnnotations(route.Method, route.Path),
+	}
+}
+
 func NewServer(options Options) (*mcp.Server, error) {
 	manifest, err := bridgecatalog.Load()
 	if err != nil {
@@ -102,6 +143,7 @@ func (s *Server) registerServerTools(server *mcp.Server) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "bridge_list_servers",
 		Description: "List bridge servers when multiple VS Code windows or bridge instances may be available. Use this to inspect candidate servers, active notebooks, and workspaces before pinning a specific target. Do not call it during every routine notebook action when the automatically matched server is already correct.",
+		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true, IdempotentHint: true, DestructiveHint: boolPtr(false), OpenWorldHint: boolPtr(false)},
 	}, func(ctx context.Context, req *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, map[string]any, error) {
 		output, isError := s.listServers(ctx)
 		return mcpResult(output, isError), output, nil
@@ -110,6 +152,7 @@ func (s *Server) registerServerTools(server *mcp.Server) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "bridge_get_active_server",
 		Description: "Return the bridge server currently selected for this MCP session. Use this when you need to confirm whether the session is still in automatic mode or is pinned to a specific override. This is mainly useful for server routing clarity, not as a required preflight before every notebook action.",
+		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true, IdempotentHint: true, DestructiveHint: boolPtr(false), OpenWorldHint: boolPtr(false)},
 	}, func(ctx context.Context, req *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, activeServerOutput, error) {
 		output, isError := s.getActiveServer(ctx)
 		return mcpResult(output, isError), output, nil
@@ -118,6 +161,7 @@ func (s *Server) registerServerTools(server *mcp.Server) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "bridge_set_active_server",
 		Description: "Pin the MCP session to a specific bridge server when automatic matching is ambiguous or wrong. Pass either a baseUrl or a serverId returned by bridge_list_servers. Keep the override only as long as needed, then clear it to restore automatic best-match selection.",
+		Annotations: &mcp.ToolAnnotations{DestructiveHint: boolPtr(false), OpenWorldHint: boolPtr(false)},
 	}, func(ctx context.Context, req *mcp.CallToolRequest, input serverOverrideInput) (*mcp.CallToolResult, activeServerOutput, error) {
 		baseURL := strings.TrimSpace(input.BaseURL)
 		if baseURL == "" {
@@ -142,6 +186,7 @@ func (s *Server) registerServerTools(server *mcp.Server) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "bridge_clear_active_server",
 		Description: "Clear any explicit server override and return this MCP session to automatic bridge selection. Use this after a temporary pin once the ambiguity is gone. There is no need to call it if the session was never overridden.",
+		Annotations: &mcp.ToolAnnotations{DestructiveHint: boolPtr(false), IdempotentHint: true, OpenWorldHint: boolPtr(false)},
 	}, func(ctx context.Context, req *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, activeServerOutput, error) {
 		s.mu.Lock()
 		s.overrideBaseURL = ""
@@ -152,30 +197,21 @@ func (s *Server) registerServerTools(server *mcp.Server) {
 }
 
 func (s *Server) registerNoArgRoute(server *mcp.Server, route bridgecatalog.RouteCapability) {
-	mcp.AddTool(server, &mcp.Tool{
-		Name:        route.Tool,
-		Description: route.Description,
-	}, func(ctx context.Context, req *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, map[string]any, error) {
+	mcp.AddTool(server, routeTool(route), func(ctx context.Context, req *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, map[string]any, error) {
 		output, isError := s.callRoute(ctx, route.Method, route.Path, nil, false)
 		return mcpResult(output, isError), output, nil
 	})
 }
 
 func (s *Server) registerQueryRoute(server *mcp.Server, route bridgecatalog.RouteCapability) {
-	mcp.AddTool(server, &mcp.Tool{
-		Name:        route.Tool,
-		Description: route.Description,
-	}, func(ctx context.Context, req *mcp.CallToolRequest, input map[string]any) (*mcp.CallToolResult, map[string]any, error) {
+	mcp.AddTool(server, routeTool(route), func(ctx context.Context, req *mcp.CallToolRequest, input map[string]any) (*mcp.CallToolResult, map[string]any, error) {
 		output, isError := s.callRoute(ctx, route.Method, route.Path, input, true)
 		return mcpResult(output, isError), output, nil
 	})
 }
 
 func (s *Server) registerBodyRoute(server *mcp.Server, route bridgecatalog.RouteCapability) {
-	mcp.AddTool(server, &mcp.Tool{
-		Name:        route.Tool,
-		Description: route.Description,
-	}, func(ctx context.Context, req *mcp.CallToolRequest, input map[string]any) (*mcp.CallToolResult, map[string]any, error) {
+	mcp.AddTool(server, routeTool(route), func(ctx context.Context, req *mcp.CallToolRequest, input map[string]any) (*mcp.CallToolResult, map[string]any, error) {
 		output, isError := s.callRoute(ctx, route.Method, route.Path, input, false)
 		return mcpResult(output, isError), output, nil
 	})

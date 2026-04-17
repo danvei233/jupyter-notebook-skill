@@ -56,6 +56,13 @@ The workflow endpoints accept lighter observation controls:
 - `observe`: `none | completion | outputSummary`
 - `includeOutput`: default `false`
 
+Practical MCP-facing rules for this bridge:
+
+- Action endpoints are compact by default. Fetch notebook, execution, or output state through dedicated read routes instead of expecting it on every mutation or run response.
+- When editing an existing cell, read it first and carry its `readToken` into the mutation request so stale writes are rejected instead of silently overwriting newer cell content.
+- `GET /commands` and `GET /capabilities` are diagnostics only. Normal MCP notebook work should rely on the registered tool surface, route descriptions, and tool annotations instead of probing the bridge first.
+- The MCP server enriches tools with read-only and destructive hints so clients can distinguish pure reads from notebook-changing actions without reverse-engineering route names.
+
 `POST /kernel/shutdown` is intentionally declared but currently unsupported.
 
 ## Control Center Sidebar
@@ -102,31 +109,31 @@ Returns the local bridge server list discovered across the configured host and p
 
 Returns the built-in quick command list.
 
+Diagnostic only. Do not use this as a normal notebook-task preflight.
+
+### `GET /capabilities`
+
+Returns bridge capability metadata.
+
+Diagnostic only. MCP clients should normally rely on the registered tool surface and descriptions instead of probing capabilities before routine notebook work.
+
 ### `GET /output/summary`
 
 Returns lightweight output summary for a target cell.
+It also distinguishes pending execution, completed-no-output, and completed-with-output.
+
+### `GET /execution/state`
+
+Returns execution observation state for the active notebook or a specific `operationId`.
+Use `waitFor` plus `timeoutMs` when you need the bridge itself to await completion or stable output instead of relying on manual sleep loops.
 
 ### `POST /cell/batch`
 
 Applies several cell mutations in one request.
+Source-bearing append, insert, and update operations are verified after apply. Transactional mode rolls back on verification failure.
 
 ### `POST /execute`
 
-Example body:
+Advanced passthrough only.
 
-```json
-{
-  "command": "jupyter.runcell",
-  "args": []
-}
-```
-
-Recommended local client:
-
-```cmd
-bridgectl.exe -method POST -path /execute -body "{\"command\":\"jupyter.runcell\",\"args\":[]}"
-```
-
-If `dataBridge.token` is set, pass `-token YOUR_TOKEN` to `bridgectl.exe`.
-
-The recommended high-level client is the stdio MCP server `jupyterbridge-mcp.exe`; use `bridgectl.exe` for low-level diagnostics, installs, and direct HTTP troubleshooting.
+Do not use this as a normal notebook-workflow entry point when a higher-level MCP tool already exists. The recommended high-level client is the stdio MCP server `jupyterbridge-mcp.exe`; reserve `bridgectl.exe` and raw route syntax for diagnostics, installs, and direct HTTP troubleshooting.

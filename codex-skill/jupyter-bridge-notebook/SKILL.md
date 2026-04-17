@@ -57,14 +57,14 @@ Default to the lightest check that keeps the target notebook unambiguous.
 
 For normal work:
 
-1. `bridge_get_status_brief` when MCP is available, otherwise `GET /status/brief`
+1. `bridge_get_status_brief`
 2. confirm active notebook `uri`, `identity.versionToken`, selection, and cell count
 3. mutate or run with the smallest safe bridge call
 
 Only escalate when risk is real:
 
 - Low risk: stable notebook identity, known `index`, mutation only.
-  Use cached bridge identity plus `bridge_post_cell_update`, `bridge_post_cell_insert`, or `bridge_post_cell_batch`.
+  Use cached bridge identity plus `bridge_post_cell_update`, `bridge_post_cell_insert`, or a small `bridge_post_cell_batch`.
 - Medium risk: mutation plus targeted run on a known cell.
   Use `bridge_get_status_brief` once, then `bridge_post_workflow_update_and_run` or `bridge_post_workflow_insert_and_run`.
 - High risk: marker lookup, notebook ambiguity, kernel lifecycle, `run all`, debugging, output drift, or multi-window uncertainty.
@@ -102,7 +102,7 @@ Read [references/plotting-style.md](references/plotting-style.md) for the reusab
 - MCP-first light state: `bridge_get_status_brief`, `bridge_get_output_summary`
 - MCP-first full state: `bridge_get_status`, `bridge_get_compliance`, `bridge_get_context`, `bridge_get_output`
 - MCP-first server binding: `bridge_list_servers`, `bridge_get_active_server`, `bridge_set_active_server`, `bridge_clear_active_server`
-- CLI fallback: `GET /status/brief`, `GET /output/summary`, `GET /servers`
+- CLI fallback: diagnostics appendix only
 - Edit cells: `bridge_post_cell_insert`, `bridge_post_cell_append`, `bridge_post_cell_update`, `bridge_post_cell_move`, `bridge_post_cell_delete`, `bridge_post_cell_batch`
 - Atomic workflows: `bridge_post_workflow_update_and_run`, `bridge_post_workflow_insert_and_run`
 - Run targeted cells: `bridge_post_run_current`, `bridge_post_run_cell`, `bridge_post_run_above`, `bridge_post_run_below`
@@ -114,13 +114,16 @@ Read [references/plotting-style.md](references/plotting-style.md) for the reusab
 
 - Do not open README, skill references, extension source, commands, or capabilities during a normal notebook task unless bridge behavior is unclear.
 - Do not call `bridge_get_capabilities` or `bridge_get_commands` during normal notebook work. Treat them as bridge diagnostics only.
-- Do not shell-run the same sklearn or analysis code that the notebook kernel is about to run.
+- When the notebook kernel is available, do not shell-run the same sklearn or analysis code that the notebook is about to run. Only use shell-side Python as an explicit diagnostic path when bridge-backed execution is unclear or the user asks for it.
 - Prefer `bridge_post_cell_batch` for stage scaffolding and `bridge_post_workflow_*` for mutation + targeted execution.
 - Prefer `bridge_get_output_summary` over full output reads unless the next step truly depends on full payload details.
 - Before mutating an existing cell, read that cell once and carry its `readToken` into the mutation call.
 - If a mutation fails with a stale-read error, re-read the cell and regenerate from the fresh source instead of retrying blindly.
+- Treat `bridge_post_cell_batch` as a stage tool, not a whole-notebook dump. Default to 2-4 closely related cells per batch unless the user explicitly asks for a larger structural operation.
+- Do not use `bridge_post_run_all` as the first meaningful validation pass for a fresh notebook build.
 
 Read [references/common-recipes.md](references/common-recipes.md) for task recipes.
+Read [references/diagnostics.md](references/diagnostics.md) only for low-level fallback syntax.
 
 ## Recovery
 

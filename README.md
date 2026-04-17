@@ -34,6 +34,9 @@ This project is designed for bridge-first notebook control inside VS Code.
 - Existing-cell mutation path: `GET /cell` -> carry `readToken` -> `POST /cell/update` or `POST /workflow/updateAndRun`.
 - Action endpoints now default to compact responses. Read state and outputs through dedicated state/output tools instead of expecting them on every mutation or run call.
 - `GET /commands` and `GET /capabilities` are diagnostic routes, not part of the normal MCP notebook workflow.
+- `POST /cell/batch` is for one stage at a time, usually 2-4 related cells, not a whole-notebook dump.
+- When the notebook kernel is available, do not pre-run the same analysis in shell-side Python as part of the normal path; reserve shell-side experiments for explicit diagnostics.
+- Do not use `POST /run/all` as the first meaningful validation step for a fresh notebook build.
 
 ## Capability Truth Source
 
@@ -62,6 +65,7 @@ jupyter-bridge-notebook-project/
 ├─ go.mod
 ├─ bridgectl.exe
 ├─ jupyterbridge-mcp.exe
+├─ diagnostics.md
 ├─ releasecheck.exe
 ├─ release-manifest.json
 ├─ cmd/
@@ -112,31 +116,20 @@ Developer: Reload Window
 
 ## Use The Bridge
 
-Check bridge status with the Go CLI:
+Normal notebook work should be MCP-first.
 
-```cmd
-.\bridgectl.exe -method GET -path /status
-```
+Use these MCP tools as the standard path:
 
-Check brief bridge status for fast notebook work:
+- `bridge_get_status_brief`
+- `bridge_get_cell`
+- `bridge_post_cell_batch`
+- `bridge_post_workflow_update_and_run`
+- `bridge_post_workflow_insert_and_run`
+- `bridge_post_run_cell`
+- `bridge_get_execution_state`
+- `bridge_get_output_summary`
 
-```cmd
-.\bridgectl.exe -method GET -path /status/brief
-```
-
-Check bridge compliance with the Go CLI:
-
-```cmd
-.\bridgectl.exe -method GET -path /compliance
-```
-
-List discovered local bridge servers:
-
-```cmd
-.\bridgectl.exe -method GET -path /servers
-```
-
-The CLI auto-discovers the best matching bridge for the current working directory and is the only supported local client. PowerShell helpers are intentionally removed.
+The CLI auto-discovers the best matching bridge for the current working directory and remains available for diagnostics, installs, and low-level troubleshooting. PowerShell helpers are intentionally removed.
 
 The CLI also keeps a short-lived cache in:
 
@@ -156,6 +149,7 @@ Core design:
 - auto-select the best bridge for the current working directory
 - optional in-process active server override
 - same cache, token, and HTTP behavior as `bridgectl.exe`
+- tool descriptions and MCP annotations are the primary guidance surface for agents; the current Go SDK version used here does not expose a dedicated `input_examples` field on `mcp.Tool`
 
 Build or run examples:
 
@@ -174,14 +168,31 @@ Build or run examples:
 Important MCP tools:
 
 - `bridge_list_servers`
+  Use only when multiple VS Code windows or bridge targets may be involved.
 - `bridge_get_active_server`
+  Use to confirm the current automatic or overridden bridge target.
 - `bridge_set_active_server`
+  Use only when automatic server matching is ambiguous or wrong.
 - `bridge_clear_active_server`
+  Use after a temporary server pin to return to automatic matching.
 - `bridge_get_status_brief`
-- `bridge_get_context`
+  Default preflight for normal notebook work.
+- `bridge_get_cell`
+  Read an existing cell and carry its `readToken` into a follow-up mutation.
+- `bridge_get_output_summary`
+  Default lightweight confirmation after execution.
+- `bridge_get_execution_state`
+  Read execution observation when you need busy/idle and completion details. It also accepts `operationId`, and callers can wait using `waitFor=completion|output|stable` plus `timeoutMs` instead of hand-written sleeps. `idle` is accepted as a legacy alias of `stable`.
+- `bridge_post_cell_batch`
+  Use for stage scaffolding or multi-cell structural edits. Keep batches small, usually 2-4 related cells, and rely on transactional write verification by default. Each operation should normally set `op`; for pure new-cell payloads with only source/kind metadata and no locator, `append` is inferred automatically.
 - `bridge_post_cell_update`
+  Use for one existing-cell edit with stale-read protection.
 - `bridge_post_workflow_update_and_run`
+  Use when a known existing cell should be updated and executed in one compact step. Read the cell first, pass its `readToken`, and then inspect `bridge_get_execution_state` or `bridge_get_output_summary` as needed.
+- `bridge_post_workflow_insert_and_run`
+  Use when a new cell should be inserted and immediately executed. The default response stays compact and returns an execution ticket; await or read output only when needed.
 - `bridge_post_run_cell`
+  Use for targeted execution once notebook identity and cell targeting are already clear.
 
 Practical MCP usage rules:
 
@@ -189,6 +200,9 @@ Practical MCP usage rules:
 - Treat action tools as atomic and compact by default.
 - Read cell state first, then mutate with the returned `readToken` when editing an existing cell.
 - Fetch notebook, execution, or output state through dedicated read tools instead of expecting action tools to carry full state payloads.
+- Treat `bridge_get_capabilities` and `bridge_get_commands` as diagnostics, not as a normal MCP notebook preflight.
+- Respect MCP annotations: read tools are marked read-only, and state-changing tools are marked as non-read-only with destructive hints only where the action can discard state or outputs.
+- Keep notebook construction stage-based. Do not dump an entire teaching notebook in one `bridge_post_cell_batch`, and do not use `bridge_post_run_all` as the first validation pass.
 
 `bridge_post_kernel_shutdown` is intentionally exposed but currently returns `unsupported`.
 
@@ -251,49 +265,9 @@ The container can be moved to the right secondary sidebar inside VS Code if that
 
 If you need a non-default bridge host, set `DATA_BRIDGE_BASE_URL` or configure the extension host and port.
 
-Read full notebook context:
+If you need CLI or raw route examples for diagnostics, use [diagnostics.md](./diagnostics.md).
 
-```cmd
-.\bridgectl.exe -method GET -path /context
-```
-
-Read only a cell output summary:
-
-```cmd
-.\bridgectl.exe -method GET -path "/output/summary?index=1"
-```
-
-Run the current notebook cell:
-
-```cmd
-.\bridgectl.exe -method POST -path /run/current
-```
-
-Run a specific cell:
-
-```cmd
-.\bridgectl.exe -method POST -path /run/cell -body "{\"index\":1}"
-```
-
-Update and run a specific cell through one bridge workflow:
-
-```cmd
-.\bridgectl.exe -method POST -path /workflow/updateAndRun -body "{\"index\":1,\"source\":\"print('hello from bridge')\",\"clearOutputs\":true}"
-```
-
-Insert a small stage in one request:
-
-```cmd
-.\bridgectl.exe -method POST -path /cell/batch -body-file .\tmp\bridgebody\stage.json
-```
-
-Clear outputs for one cell:
-
-```cmd
-.\bridgectl.exe -method POST -path /cell/clearOutputs -body "{\"index\":1}"
-```
-
-If you need `-body-file`, prefer storing temporary payloads under:
+If you need `-body-file` in diagnostics mode, prefer storing temporary payloads under:
 
 ```text
 .\tmp\bridgebody\
