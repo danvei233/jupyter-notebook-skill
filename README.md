@@ -1,5 +1,7 @@
 # Jupyter Bridge Notebook
 
+[中文说明](./README.zh-CN.md)
+
 Bridge-first Jupyter notebook tooling for VS Code, paired with a Codex skill for fast `.ipynb` operations and notebook structuring.
 
 This repository contains the source for:
