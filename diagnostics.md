@@ -5,13 +5,13 @@ Use this file only for low-level troubleshooting, install validation, or transpo
 ## CLI Shape
 
 ```cmd
-.\bridgectl.exe -method GET -path /status/brief
-.\bridgectl.exe -method GET -path /context
-.\bridgectl.exe -method GET -path "/output/summary?index=1"
-.\bridgectl.exe -method POST -path /run/current
-.\bridgectl.exe -method POST -path /run/cell -body "{\"index\":1}"
-.\bridgectl.exe -method POST -path /workflow/updateAndRun -body-file .\tmp\bridgebody\workflow.json
-.\bridgectl.exe -method POST -path /cell/batch -body-file .\tmp\bridgebody\stage.json
+bridgectl(.exe) -method GET -path /status/brief
+bridgectl(.exe) -method GET -path /context
+bridgectl(.exe) -method GET -path "/output/summary?index=1"
+bridgectl(.exe) -method POST -path /run/current
+bridgectl(.exe) -method POST -path /run/cell -body "{\"index\":1}"
+bridgectl(.exe) -method POST -path /workflow/updateAndRun -body-file ./tmp/bridgebody/workflow.json
+bridgectl(.exe) -method POST -path /cell/batch -body-file ./tmp/bridgebody/stage.json
 ```
 
 Rules:

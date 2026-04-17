@@ -1,7 +1,0 @@
-interface:
-  display_name: "Jupyter Notebook Bridge"
-  short_description: "Operate and structure VS Code notebooks"
-  default_prompt: "Use $jupyter-bridge-notebook to operate and structure the active .ipynb in VS Code."
-
-policy:
-  allow_implicit_invocation: true

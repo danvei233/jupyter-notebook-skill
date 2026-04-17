@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "jupyter-bridge": {
+      "command": "__INSTALL_DIR__/scripts/jupyterbridge-mcp",
+      "args": []
+    }
+  }
+}

@@ -2,13 +2,13 @@
 
 Bridge-first Jupyter notebook tooling for VS Code, paired with a Codex skill for fast `.ipynb` operations and notebook structuring.
 
-This project bundles:
+This repository contains the source for:
 
 - a local VS Code extension: `local.vscode-data-bridge`
 - a Codex skill: `jupyter-bridge-notebook`
-- a Go CLI: `bridgectl.exe`
-- a Go stdio MCP server: `jupyterbridge-mcp.exe`
-- a portable VSIX for installation and migration
+- a Go CLI: `bridgectl`
+- a Go stdio MCP server: `jupyterbridge-mcp`
+- a release workflow that publishes Windows and Linux artifacts plus a packaged skill bundle
 
 ## What It Does
 
@@ -62,11 +62,11 @@ Project docs, the skill cheatsheet, and the MCP tool registry should be kept ali
 jupyter-bridge-notebook-project/
 ├─ README.md
 ├─ .gitignore
+├─ .github/
+│  └─ workflows/
+│     └─ release.yml
 ├─ go.mod
-├─ bridgectl.exe
-├─ jupyterbridge-mcp.exe
 ├─ diagnostics.md
-├─ releasecheck.exe
 ├─ release-manifest.json
 ├─ cmd/
 │  └─ bridgectl/
@@ -88,30 +88,46 @@ jupyter-bridge-notebook-project/
 │  ├─ package.json
 │  ├─ package-lock.json
 │  ├─ README.md
-│  ├─ vscode-data-bridge-0.0.1.vsix
 │  └─ .vscode/
 └─ codex-skill/
    └─ jupyter-bridge-notebook/
       ├─ SKILL.md
       ├─ install.md
       ├─ agents/openai.yaml
+      ├─ bin/
       ├─ scripts/
       ├─ references/
       └─ assets/vscode-data-bridge/
 ```
 
-## Install The VS Code Extension
+## Install The Skill And Bridge
 
-Install the bundled VSIX:
+The preferred path is a single installer command after user approval.
 
-```cmd
-bridgectl.exe -install-extension .\bridge-extension\vscode-data-bridge-0.0.1.vsix
-```
-
-Then reload VS Code:
+From a source checkout:
 
 ```text
-Developer: Reload Window
+go run ./cmd/bridgectl -install-skill . -configure-mcp auto
+```
+
+From an extracted release bundle:
+
+```text
+bin/<os-arch>/bridgectl(.exe) -install-skill . -configure-mcp auto
+```
+
+The installer will:
+
+- copy `jupyter-bridge-notebook` into the user's Codex skill directory
+- materialize the current platform binaries into the installed skill `scripts/` folder
+- build or reuse the VSIX
+- install `local.vscode-data-bridge`
+- update detected Codex / Claude Desktop MCP config files
+
+If you only need the extension install from a locally packaged VSIX:
+
+```text
+go run ./cmd/bridgectl -install-extension ./bridge-extension/vscode-data-bridge-0.0.1.vsix
 ```
 
 ## Use The Bridge
@@ -141,28 +157,28 @@ This avoids scanning the full bridge port range on every call. The cache expires
 
 ## Use The MCP Server
 
-`jupyterbridge-mcp.exe` wraps the same local Data Bridge over MCP stdio transport.
+`jupyterbridge-mcp(.exe)` wraps the same local Data Bridge over MCP stdio transport.
 
 Core design:
 
 - tools-only MCP v1
 - auto-select the best bridge for the current working directory
 - optional in-process active server override
-- same cache, token, and HTTP behavior as `bridgectl.exe`
+- same cache, token, and HTTP behavior as `bridgectl(.exe)`
 - tool descriptions and MCP annotations are the primary guidance surface for agents; the current Go SDK version used here does not expose a dedicated `input_examples` field on `mcp.Tool`
 
 Build or run examples:
 
-```cmd
-.\jupyterbridge-mcp.exe
+```text
+go run ./cmd/jupyterbridge-mcp
 ```
 
-```cmd
-.\jupyterbridge-mcp.exe -cwd .
+```text
+go run ./cmd/jupyterbridge-mcp -cwd .
 ```
 
-```cmd
-.\jupyterbridge-mcp.exe -base-url http://127.0.0.1:8765
+```text
+go run ./cmd/jupyterbridge-mcp -base-url http://127.0.0.1:8765
 ```
 
 Important MCP tools:
@@ -206,23 +222,7 @@ Practical MCP usage rules:
 
 `bridge_post_kernel_shutdown` is intentionally exposed but currently returns `unsupported`.
 
-Example Codex/Claude-style MCP registration:
-
-```json
-{
-  "mcpServers": {
-    "jupyter-bridge": {
-      "command": "D:\\sky\\jupyter-bridge-notebook-project\\jupyterbridge-mcp.exe",
-      "args": [
-        "-cwd",
-        "D:\\sky"
-      ]
-    }
-  }
-}
-```
-
-Ready-made examples are also bundled under:
+Ready-made config snippets are bundled under:
 
 ```text
 .\mcp-examples\
@@ -247,6 +247,25 @@ The required file list is stored in:
 ```text
 .\release-manifest.json
 ```
+
+## GitHub Releases
+
+GitHub Actions builds and publishes at least these release assets:
+
+- `bridgectl-windows-amd64.zip`
+- `bridgectl-linux-amd64.tar.gz`
+- `jupyterbridge-mcp-windows-amd64.zip`
+- `jupyterbridge-mcp-linux-amd64.tar.gz`
+- `vscode-data-bridge-0.0.1.vsix`
+- `jupyter-bridge-notebook-skill-bundle.zip`
+
+The workflow lives at:
+
+```text
+.\.github\workflows\release.yml
+```
+
+The source repo stays clean; platform binaries and packaged VSIX files are release artifacts, not required checked-in source files.
 
 ## Control Center Sidebar
 
@@ -304,12 +323,12 @@ The skill is designed to:
 
 - verify the target notebook before mutation or execution
 - inspect notebook and kernel state before acting
-- prefer MCP tools first, then `bridgectl.exe`, over direct `.ipynb` file edits
+- prefer MCP tools first, then `bridgectl(.exe)`, over direct `.ipynb` file edits
 - structure notebooks into task-oriented cells with sensible markdown headings
-- use `bridgectl.exe` instead of PowerShell helpers
+- use `bridgectl(.exe)` instead of PowerShell helpers
 
 ## GitHub Notes
 
-- `node_modules` is intentionally excluded from this packaged folder
-- the portable VSIX is included so the extension can be installed without rebuilding
-- the skill also includes a copy of the extension assets for migration
+- `node_modules`, `tmp` payloads, packaged binaries, and generated VSIX files are ignored in source control
+- the release workflow assembles portable artifacts and a bundled skill archive for Windows and Linux
+- the source skill stays lightweight; the installer materializes current-platform binaries into the installed skill folder

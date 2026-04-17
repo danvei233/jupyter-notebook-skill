@@ -16,10 +16,10 @@ Do not use them as the first step in normal notebook work.
 Only use this when the MCP client cannot call the bridge tools directly.
 
 ```text
-bridgectl.exe -method GET -path /status/brief
-bridgectl.exe -method GET -path /context
-bridgectl.exe -method POST -path /workflow/updateAndRun -body-file ./tmp/bridgebody/workflow.json
-bridgectl.exe -method POST -path /cell/batch -body-file ./tmp/bridgebody/stage.json
+bridgectl(.exe) -method GET -path /status/brief
+bridgectl(.exe) -method GET -path /context
+bridgectl(.exe) -method POST -path /workflow/updateAndRun -body-file ./tmp/bridgebody/workflow.json
+bridgectl(.exe) -method POST -path /cell/batch -body-file ./tmp/bridgebody/stage.json
 ```
 
 Rules:

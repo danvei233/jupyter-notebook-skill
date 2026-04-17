@@ -10,8 +10,8 @@ Use the local VS Code Data Bridge as the default control plane for notebook work
 Execution priority:
 
 1. MCP tools backed by the local Data Bridge
-2. `scripts/jupyterbridge-mcp.exe` when the MCP client still needs a local stdio server binary from the skill bundle
-3. `scripts/bridgectl.exe` as a fallback transport and low-level diagnostic client
+2. the installed platform binary under `scripts/jupyterbridge-mcp(.exe)` when the MCP client still needs a local stdio server binary from the installed skill
+3. the installed platform binary under `scripts/bridgectl(.exe)` as a fallback transport and low-level diagnostic client
 4. non-bridge fallback only with explicit user approval
 
 ## Core Contract
@@ -19,9 +19,9 @@ Execution priority:
 - When the bridge is available, notebook mutation and execution must go through the bridge.
 - Do not silently fall back to `.py` generators, `nbclient`, `nbconvert`, or direct `.ipynb` rewriting.
 - Do not claim a cell ran or produced outputs unless bridge-backed execution or direct bridge output reads confirm it.
-- PowerShell is forbidden for this skill. Use `scripts/bridgectl.exe`.
+- PowerShell is forbidden for this skill. Use the installed `scripts/bridgectl(.exe)` binary.
 - Do not explain or rely on raw HTTP route syntax during normal notebook work. Default to MCP tools and let the MCP client carry transport details.
-- Only drop down to `bridgectl.exe` syntax when MCP is unavailable or when low-level diagnostics are required.
+- Only drop down to `bridgectl(.exe)` syntax when MCP is unavailable or when low-level diagnostics are required.
 - If temporary JSON request bodies are needed for `bridgectl -body-file`, store them under `./tmp/bridgebody/` in the current working directory, not in the project root.
 - For multi-line source, long markdown, or larger JSON payloads, default to `bridgectl -body-file` instead of inline `-body`.
 - Treat the capability manifest as the truth source. If docs and behavior disagree, verify against the manifest-backed MCP tool set or the current bridge responses.
@@ -117,6 +117,7 @@ Read [references/plotting-style.md](references/plotting-style.md) for the reusab
 - When the notebook kernel is available, do not shell-run the same sklearn or analysis code that the notebook is about to run. Only use shell-side Python as an explicit diagnostic path when bridge-backed execution is unclear or the user asks for it.
 - Prefer `bridge_post_cell_batch` for stage scaffolding and `bridge_post_workflow_*` for mutation + targeted execution.
 - Prefer `bridge_get_output_summary` over full output reads unless the next step truly depends on full payload details.
+- When a single blocking call is simpler than a separate await/read cycle, prefer `block=true` with `timeoutMs` on `bridge_post_run_*` or `bridge_post_workflow_*` instead of external sleep loops.
 - Before mutating an existing cell, read that cell once and carry its `readToken` into the mutation call.
 - If a mutation fails with a stale-read error, re-read the cell and regenerate from the fresh source instead of retrying blindly.
 - Treat `bridge_post_cell_batch` as a stage tool, not a whole-notebook dump. Default to 2-4 closely related cells per batch unless the user explicitly asks for a larger structural operation.
@@ -158,5 +159,11 @@ Read:
 If bridge features are missing:
 
 1. Read [install.md](install.md)
-2. Check with `scripts/bridgectl.exe -check-extension -extension-id local.vscode-data-bridge`
-3. After user approval, install with `scripts/bridgectl.exe -install-extension ..\\assets\\vscode-data-bridge\\vscode-data-bridge-0.0.1.vsix`
+2. Explain that the one-click installer will:
+   - copy the skill into the user's Codex skill directory
+   - materialize the current platform binaries into the installed skill `scripts/` folder
+   - install the VS Code extension
+   - update Codex / Claude MCP config when those clients are detected
+3. After user approval, run the installer:
+   - from a source checkout: `go run ./cmd/bridgectl -install-skill . -configure-mcp auto`
+   - from an extracted release bundle: `bin/<os-arch>/bridgectl(.exe) -install-skill . -configure-mcp auto`

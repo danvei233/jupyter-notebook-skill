@@ -136,4 +136,4 @@ Source-bearing append, insert, and update operations are verified after apply. T
 
 Advanced passthrough only.
 
-Do not use this as a normal notebook-workflow entry point when a higher-level MCP tool already exists. The recommended high-level client is the stdio MCP server `jupyterbridge-mcp.exe`; reserve `bridgectl.exe` and raw route syntax for diagnostics, installs, and direct HTTP troubleshooting.
+Do not use this as a normal notebook-workflow entry point when a higher-level MCP tool already exists. The recommended high-level client is the stdio MCP server `jupyterbridge-mcp(.exe)`; reserve `bridgectl(.exe)` and raw route syntax for diagnostics, installs, and direct HTTP troubleshooting.

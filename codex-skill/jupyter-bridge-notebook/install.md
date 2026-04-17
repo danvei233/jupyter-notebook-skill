@@ -1,57 +1,87 @@
 # Install
 
-This skill depends on the VS Code extension `local.vscode-data-bridge`.
+This skill is meant to be installed through the `bridgectl` installer rather than by hand-copying files one by one.
 
-## When To Use This File
+## When To Read This File
 
 Read this file when:
 
-- bridge calls fail
-- `bridge_get_status_brief` is unavailable
-- notebook bridge commands are missing
-- the skill is being migrated to another machine
+- the skill is not installed yet
+- bridge tools are missing
+- the MCP server binary is missing
+- the VS Code extension is missing
+- Codex or Claude Desktop still has no `jupyter-bridge` MCP entry
 
-## Standard Install Flow
+## What The One-Click Installer Does
 
-1. Detect whether the extension is installed:
-   - run `scripts/bridgectl.exe -check-extension -extension-id local.vscode-data-bridge`
-2. If it is already installed:
-   - keep using the existing bridge
-3. If it is missing:
-   - ask the user for approval to install the extension
-4. After approval:
-   - run `scripts/bridgectl.exe -install-extension ..\\assets\\vscode-data-bridge\\vscode-data-bridge-0.0.1.vsix`
-5. After install:
-   - ask the user to run `Developer: Reload Window`
-   - then verify with `bridge_get_status_brief`
-   - then verify with `bridge_get_compliance`
+After user approval, the installer should do all of this automatically:
 
-## MCP-First Verification
+1. copy the skill into the user's Codex skill directory
+2. place the current platform binaries into the installed skill `scripts/` folder:
+   - `scripts/bridgectl(.exe)`
+   - `scripts/jupyterbridge-mcp(.exe)`
+3. ensure the bundled VS Code extension VSIX exists, building it locally if the source checkout does not already include one
+4. install `local.vscode-data-bridge` through the VS Code CLI
+5. detect supported MCP clients and update their config files:
+   - Codex: `config.toml`
+   - Claude Desktop: `claude_desktop_config.json`
 
-When the client supports MCP, verify the bridge in this order:
+Do not silently run this flow. Explain it first and get user approval.
+
+## Standard Install Commands
+
+From a source checkout of the repository:
+
+```text
+go run ./cmd/bridgectl -install-skill . -configure-mcp auto
+```
+
+From an extracted release bundle:
+
+```text
+bin/<os-arch>/bridgectl(.exe) -install-skill . -configure-mcp auto
+```
+
+Optional flags:
+
+- `-skill-dest <path>`
+  Use a non-default install location instead of `$CODEX_HOME/skills/jupyter-bridge-notebook`.
+- `-configure-mcp auto|codex|claude-desktop|all|none`
+  Control which client configs are updated.
+- `-skip-extension`
+  Skip VS Code extension install.
+- `-skip-config`
+  Skip MCP config updates.
+
+## Default Install Targets
+
+By default the installer writes:
+
+- Codex skill:
+  - `$CODEX_HOME/skills/jupyter-bridge-notebook`
+  - or `~/.codex/skills/jupyter-bridge-notebook` if `CODEX_HOME` is unset
+- Codex MCP config:
+  - `$CODEX_HOME/config.toml`
+  - or `~/.codex/config.toml`
+- Claude Desktop MCP config:
+  - Windows: `%APPDATA%\\Claude\\claude_desktop_config.json`
+  - Linux: `~/.config/Claude/claude_desktop_config.json`
+
+## Verification Order
+
+After install and reload, verify in this order:
 
 1. `bridge_get_status_brief`
 2. `bridge_get_compliance`
 3. `bridge_get_active_server`
 
-Use `scripts/bridgectl.exe` only when MCP is not yet configured or when low-level troubleshooting is needed.
+Use low-level CLI checks only when MCP still is not visible.
 
-## Bundled Migration Assets
+## Source Repo vs Release Bundle
 
-The skill includes a portable copy of the bridge extension under `assets/vscode-data-bridge/`:
+The source repository is kept clean and does not need to track platform binaries.
 
-- `vscode-data-bridge-0.0.1.vsix`
-- `extension.js`
-- `package.json`
-- `README.md`
+- In the source repo, the installer can build the current platform binaries locally from `cmd/`.
+- In a release bundle, prebuilt platform binaries are provided under `bin/<os-arch>/`.
 
-The skill includes `scripts/bridgectl.exe` as the preferred local bridge client and extension installer.
-The skill also includes `scripts/jupyterbridge-mcp.exe` as the preferred bundled stdio MCP server for clients that need a local MCP executable.
-
-Use these bundled files as the preferred migration source instead of relying on an external path.
-
-`bridgectl.exe` auto-detects `code-insiders` or `code` from PATH and can also use `VSCODE_CLI` or `CODE_CLI`.
-
-## Consent Rule
-
-Do not install the extension silently. Ask the user first. Once the user agrees, run the bundled `bridgectl.exe` install command automatically.
+The installed skill always ends up with platform-specific binaries materialized into its `scripts/` directory so that normal skill usage can refer to stable local paths.

@@ -1,0 +1,3 @@
+[mcp_servers.jupyter-bridge]
+command = '__INSTALL_DIR__/scripts/jupyterbridge-mcp'
+enabled = true

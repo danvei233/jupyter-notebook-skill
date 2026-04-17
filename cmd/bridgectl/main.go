@@ -131,9 +131,32 @@ func main() {
 	extensionID := flag.String("extension-id", "local.vscode-data-bridge", "Extension id used with -check-extension")
 	checkExtension := flag.Bool("check-extension", false, "Check whether an extension is installed via the VS Code CLI")
 	installExtension := flag.String("install-extension", "", "Install a VSIX file via the VS Code CLI")
+	installSkill := flag.String("install-skill", "", "Install the jupyter-bridge-notebook skill from a project root or extracted skill bundle")
+	skillName := flag.String("skill-name", defaultSkillName, "Skill name used with -install-skill")
+	skillDest := flag.String("skill-dest", "", "Explicit skill destination directory; defaults to CODEX_HOME/skills/<skill-name>")
+	configureMCP := flag.String("configure-mcp", "auto", "MCP config update target: auto, codex, claude-desktop, all, or none")
+	skipExtension := flag.Bool("skip-extension", false, "Skip VS Code extension installation during -install-skill")
+	skipConfig := flag.Bool("skip-config", false, "Skip MCP config updates during -install-skill")
 	var cmdArgs stringSliceFlag
 	flag.Var(&cmdArgs, "arg", "Command arg used with -command; may be repeated")
 	flag.Parse()
+
+	if *installSkill != "" {
+		if err := installSkillBundle(installSkillOptions{
+			InputPath:     *installSkill,
+			SkillName:     *skillName,
+			SkillDest:     *skillDest,
+			ConfigureMCP:  *configureMCP,
+			CodeCLI:       *codeCLIFlag,
+			SkipExtension: *skipExtension,
+			SkipConfig:    *skipConfig,
+			Pretty:        *pretty,
+		}); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	if *checkExtension || *installExtension != "" {
 		codeCLI, err := resolveCodeCLI(*codeCLIFlag)
