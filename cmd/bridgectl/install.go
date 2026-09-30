@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 )
 
@@ -76,6 +77,28 @@ func firstExisting(paths ...string) string {
 	return ""
 }
 
+func findVSIX(directory string) string {
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return ""
+	}
+	var matches []string
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if strings.HasPrefix(name, "vscode-data-bridge-") && strings.HasSuffix(name, ".vsix") {
+			matches = append(matches, filepath.Join(directory, name))
+		}
+	}
+	sort.Strings(matches)
+	if len(matches) == 0 {
+		return ""
+	}
+	return matches[len(matches)-1]
+}
+
 func detectInstallSource(inputPath, skillName string) (installSource, error) {
 	absolute, err := filepath.Abs(inputPath)
 	if err != nil {
@@ -87,19 +110,14 @@ func detectInstallSource(inputPath, skillName string) (installSource, error) {
 		source.ProjectRoot = absolute
 		source.SkillSourceDir = filepath.Join(absolute, "codex-skill", skillName)
 		source.ExtensionSourceDir = filepath.Join(absolute, "bridge-extension")
-		source.PrebuiltVSIX = firstExisting(
-			filepath.Join(source.ExtensionSourceDir, "vscode-data-bridge-0.0.1.vsix"),
-			filepath.Join(source.SkillSourceDir, "assets", "vscode-data-bridge", "vscode-data-bridge-0.0.1.vsix"),
-		)
+		source.PrebuiltVSIX = firstExisting(findVSIX(source.ExtensionSourceDir), findVSIX(filepath.Join(source.SkillSourceDir, "assets", "vscode-data-bridge")))
 		return source, nil
 	}
 
 	if fileExists(filepath.Join(absolute, "SKILL.md")) {
 		source.SkillSourceDir = absolute
 		source.ExtensionSourceDir = filepath.Join(absolute, "assets", "vscode-data-bridge")
-		source.PrebuiltVSIX = firstExisting(
-			filepath.Join(source.ExtensionSourceDir, "vscode-data-bridge-0.0.1.vsix"),
-		)
+		source.PrebuiltVSIX = findVSIX(source.ExtensionSourceDir)
 
 		current := absolute
 		for {
@@ -270,9 +288,9 @@ func ensureVSIX(source installSource, skillInstallDir string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("vsce package failed: %s", strings.TrimSpace(string(output)))
 	}
-	vsixPath := firstExisting(filepath.Join(source.ExtensionSourceDir, "vscode-data-bridge-0.0.1.vsix"))
+	vsixPath := findVSIX(source.ExtensionSourceDir)
 	if vsixPath == "" {
-		return "", errors.New("vsce package did not produce vscode-data-bridge-0.0.1.vsix")
+		return "", errors.New("vsce package did not produce a vscode-data-bridge .vsix file")
 	}
 	target := filepath.Join(skillInstallDir, "assets", "vscode-data-bridge", filepath.Base(vsixPath))
 	return target, copyFileWithMode(vsixPath, target, 0o644)
